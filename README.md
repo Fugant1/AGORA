@@ -2,7 +2,7 @@
 
 **Acoustically Grounded Speech Emotion Recognition via Group Relative Policy Optimization (GRPO)**
 
-[![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1uWwj1vchyIj-EiyJgGGL41Mn_DQJWOPx?usp=sharing)
+[![Colab]([https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1uWwj1vchyIj-EiyJgGGL41Mn_DQJWOPx?usp=sharing](https://colab.research.google.com/github/Fugant1/OPERA/blob/main/ser_grpo_v2.ipynb))
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
