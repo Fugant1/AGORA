@@ -1,4 +1,4 @@
-# OPERA: Omni-modal Preference Extraction and Ranking Architecture
+# AGORA: Acoustic-Grounded Omni Reasoning for Affect
 
 **Acoustically Grounded Speech Emotion Recognition via Group Relative Policy Optimization (GRPO)**
 
