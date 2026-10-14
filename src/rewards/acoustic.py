@@ -162,31 +162,35 @@ def build_acoustic_audio_lookup(
     return df.set_index("audio_path")[cols_to_keep].to_dict(orient="index")
 
 
-def score_acoustic_piece(truth_tier: str, pred_tier: Optional[str]) -> float:
-    """Computes the reward score for an individual continuous acoustic dimension in [0.0, 1.0]:
+def score_acoustic_piece(
+    truth_tier: str,
+    pred_tier: Optional[str],
+    cue_name: Optional[str] = None,
+    weights_dict: Optional[Dict[str, Dict[str, float]]] = None,
+) -> float:
+    """Computes the reward score for an individual continuous acoustic dimension.
 
-      - Truth High/Low ; Predicted High/Low (Extremes Match) -> +1.0
-      - Truth Moderate ; Predicted Moderate (Moderate Match) -> +0.5
-      - Any error (miss, polar inversion, mismatch, missing) ->  0.0
+    Calibrated via square-root smoothed inverse frequency:
+      - Match: calibrated weight w_c(truth_tier) in (0.0, 1.0].
+      - Mismatch / Missing / None: 0.0.
     """
-    if pred_tier is None:
+    if pred_tier is None or not truth_tier:
         return 0.0
 
-    t = truth_tier.lower()
-    p = pred_tier.lower()
+    t = str(truth_tier).lower().strip()
+    p = str(pred_tier).lower().strip()
 
-    if t in ("high", "low"):
-        if p == t:
-            return 1.0
-        else:
-            return 0.0
-    elif t == "moderate":
-        if p == "moderate":
-            return 0.5
-        else:
-            return 0.0
+    if p != t:
+        return 0.0
 
-    return 0.0
+    if weights_dict and cue_name and cue_name in weights_dict and t in weights_dict[cue_name]:
+        return float(weights_dict[cue_name][t])
+
+    # Smooth theoretical fallback for quartiles (25% low, 50% moderate, 25% high):
+    # sqrt(0.25 / 0.50) = 0.7071 for moderate; 1.0 for low/high
+    if t == "moderate":
+        return 0.7071
+    return 1.0
 
 
 def determine_voice_quality_ground_truth(
@@ -244,33 +248,120 @@ def determine_voice_quality_ground_truth(
     return "modal/normal"
 
 
-def score_voice_quality_piece(truth_quality: str, pred_quality: Optional[str]) -> float:
-    """Computes the reward score for the Voice Quality dimension in [0.0, 1.0]:
+def score_voice_quality_piece(
+    truth_quality: str,
+    pred_quality: Optional[str],
+    weights_dict: Optional[Dict[str, Dict[str, float]]] = None,
+) -> float:
+    """Computes the reward score for the Voice Quality dimension.
 
-      - Truth Marked (pressed/tense, breathy, harsh/creaky) ; Predicted Marked (Match) -> +1.0
-      - Truth modal/normal ; Predicted modal/normal (Moderate Match)                     -> +0.5
-      - Any error (miss, conflicting marked, modal/marked mismatch, missing)            ->  0.0
+    Calibrated via square-root smoothed inverse frequency:
+      - Match: calibrated weight w_vq(truth_quality) in (0.0, 1.0].
+      - Mismatch / Missing / None: 0.0.
     """
-    if pred_quality is None:
+    if pred_quality is None or not truth_quality:
         return 0.0
 
-    t = truth_quality.lower().strip()
-    p = pred_quality.lower().strip()
+    t = str(truth_quality).lower().strip()
+    p = str(pred_quality).lower().strip()
 
-    marked = {"pressed/tense", "breathy", "harsh/creaky"}
+    if p != t:
+        return 0.0
 
-    if t in marked:
-        if p == t:
-            return 1.0
-        else:
-            return 0.0
-    elif t == "modal/normal":
-        if p == "modal/normal":
-            return 0.5
-        else:
-            return 0.0
+    if weights_dict and "voice_quality" in weights_dict and t in weights_dict["voice_quality"]:
+        return float(weights_dict["voice_quality"][t])
 
-    return 0.0
+    # Fallback when weights are not calibrated
+    if t == "modal/normal":
+        return 0.7071
+    return 1.0
+
+
+def compute_acoustic_cue_weights(
+    train_df: pd.DataFrame,
+    quantiles_dict: Dict[str, Dict[str, Dict[str, float]]],
+    power: float = 0.5,
+    cues_map: Dict[str, str] = CUE_FEATURE_MAP,
+    vq_map: Dict[str, str] = VOICE_QUALITY_FEATURE_MAP,
+) -> Dict[str, Dict[str, float]]:
+    """Computes calibrated weights via square-root smoothed inverse frequency (power=0.5)
+    for each category across all 5 acoustic cues on the GRPO training set.
+
+    Formula:
+      w_c(k) = (min_j f_c(j) / f_c(k)) ** 0.5
+
+    Guarantees:
+      1. Every acoustic cue is calibrated to the empirical distribution in the dataset.
+      2. The maximum score per cue is exactly 1.0 (scale [0.0, 1.0] per cue).
+      3. Normalized reward is strictly in [0.0, 1.0].
+      4. Eliminates arbitrary 'moderate' penalties and blind extreme bonuses.
+    """
+    counts: Dict[str, Dict[str, int]] = {
+        cue: {"low": 0, "moderate": 0, "high": 0} for cue in cues_map
+    }
+    counts["voice_quality"] = {
+        "modal/normal": 0,
+        "pressed/tense": 0,
+        "breathy": 0,
+        "harsh/creaky": 0,
+    }
+
+    for _, row in train_df.iterrows():
+        spk = row.get("speaker", "__GLOBAL__")
+        spk_q = quantiles_dict.get(spk, quantiles_dict.get("__GLOBAL__", {}))
+
+        for cue_name, feat_col in cues_map.items():
+            if feat_col in row and not pd.isna(row[feat_col]) and cue_name in spk_q:
+                val = float(row[feat_col])
+                q25 = spk_q[cue_name]["q25"]
+                q75 = spk_q[cue_name]["q75"]
+                if val <= q25:
+                    counts[cue_name]["low"] += 1
+                elif val <= q75:
+                    counts[cue_name]["moderate"] += 1
+                else:
+                    counts[cue_name]["high"] += 1
+
+        vq_vals = {}
+        for sub_cue, col_name in vq_map.items():
+            if col_name in row and not pd.isna(row[col_name]):
+                vq_vals[sub_cue] = float(row[col_name])
+
+        if len(vq_vals) == len(vq_map) and all(k in spk_q for k in vq_vals):
+            vq_gt = determine_voice_quality_ground_truth(
+                jitter_val=vq_vals["jitter"],
+                shimmer_val=vq_vals["shimmer"],
+                hnr_val=vq_vals["hnr"],
+                hammarberg_val=vq_vals["hammarberg"],
+                quantiles=spk_q,
+            )
+            if vq_gt in counts["voice_quality"]:
+                counts["voice_quality"][vq_gt] += 1
+
+    weights_dict: Dict[str, Dict[str, float]] = {}
+
+    for cue_name, cat_counts in counts.items():
+        total_valid = sum(cat_counts.values())
+        weights_dict[cue_name] = {}
+
+        if total_valid == 0:
+            for cat in cat_counts:
+                weights_dict[cue_name][cat] = 0.7071 if cat in ("moderate", "modal/normal") else 1.0
+            continue
+
+        num_cats = len(cat_counts)
+        freqs = {
+            cat: (cnt + 1) / (total_valid + num_cats)
+            for cat, cnt in cat_counts.items()
+        }
+
+        raw_inv = {cat: (1.0 / f) ** power for cat, f in freqs.items()}
+        max_inv = max(raw_inv.values())
+
+        for cat, inv_val in raw_inv.items():
+            weights_dict[cue_name][cat] = round(float(inv_val / max_inv), 4)
+
+    return weights_dict
 
 
 class AcousticInventoryReward:
@@ -279,16 +370,22 @@ class AcousticInventoryReward:
     def __init__(
         self,
         quantiles_ref: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
+        weights_ref: Optional[Dict[str, Dict[str, float]]] = None,
         audio_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
         normalize: bool = False,
     ):
         self.quantiles_ref = quantiles_ref or {}
+        self.weights_ref = weights_ref or {}
         self.audio_lookup = audio_lookup or {}
         self.normalize = normalize
 
     def set_quantiles(self, quantiles_ref: Dict[str, Dict[str, Dict[str, float]]]) -> None:
         """Update active speaker quantiles reference."""
         self.quantiles_ref = quantiles_ref
+
+    def set_weights(self, weights_ref: Dict[str, Dict[str, float]]) -> None:
+        """Update calibrated acoustic cue weights reference."""
+        self.weights_ref = weights_ref
 
     def set_audio_lookup(self, audio_lookup: Dict[str, Dict[str, Any]]) -> None:
         """Update audio_path -> feature cache lookup."""
@@ -310,6 +407,7 @@ class AcousticInventoryReward:
         speakers = kwargs.get("speaker", [None] * len(completions))
         audio_paths = kwargs.get("audio_path", [None] * len(completions))
         parsed_list = kwargs.get("parsed_completions")
+        active_weights = kwargs.get("acoustic_cue_weights", self.weights_ref)
 
         for idx, comp in enumerate(completions):
             if parsed_list is not None and idx < len(parsed_list):
@@ -359,7 +457,9 @@ class AcousticInventoryReward:
                     raw_clean = str(raw_pred).lower().strip()
                     pred_tier = PRED_TIER_MAP.get(cue_name, {}).get(raw_clean)
 
-                cue_scores[cue_name] = score_acoustic_piece(truth_tier, pred_tier)
+                cue_scores[cue_name] = score_acoustic_piece(
+                    truth_tier, pred_tier, cue_name=cue_name, weights_dict=active_weights
+                )
 
             # 2. Evaluate composite Voice Quality (Jitter, Shimmer, HNR, Hammarberg)
             vq_vals = {}
@@ -386,7 +486,9 @@ class AcousticInventoryReward:
                     raw_vq_clean = str(raw_vq_pred).lower().strip()
                     pred_vq = VOICE_QUALITY_CHOICES.get(raw_vq_clean)
 
-                cue_scores["voice_quality"] = score_voice_quality_piece(truth_vq, pred_vq)
+                cue_scores["voice_quality"] = score_voice_quality_piece(
+                    truth_vq, pred_vq, weights_dict=active_weights
+                )
 
             if cue_scores:
                 total = sum(cue_scores.values())
@@ -402,6 +504,7 @@ def reward_acoustic_inventory(
     prompts: List[str],
     completions: List[str],
     quantiles_ref: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
+    weights_ref: Optional[Dict[str, Dict[str, float]]] = None,
     audio_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
     normalize: bool = False,
     **kwargs: Any,
@@ -409,6 +512,7 @@ def reward_acoustic_inventory(
     """Functional wrapper for AcousticInventoryReward."""
     rewarder = AcousticInventoryReward(
         quantiles_ref=quantiles_ref,
+        weights_ref=weights_ref,
         audio_lookup=audio_lookup,
         normalize=normalize,
     )
