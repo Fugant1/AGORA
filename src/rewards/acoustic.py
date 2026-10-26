@@ -186,10 +186,10 @@ def score_acoustic_piece(
     if weights_dict and cue_name and cue_name in weights_dict and t in weights_dict[cue_name]:
         return float(weights_dict[cue_name][t])
 
-    # Smooth theoretical fallback for quartiles (25% low, 50% moderate, 25% high):
-    # sqrt(0.25 / 0.50) = 0.7071 for moderate; 1.0 for low/high
+    # Theoretical fallback for quartiles (25% low, 50% moderate, 25% high):
+    # 0.25 / 0.50 = 0.5 for moderate; 1.0 for low/high
     if t == "moderate":
-        return 0.7071
+        return 0.5
     return 1.0
 
 
@@ -240,11 +240,7 @@ def determine_voice_quality_ground_truth(
     if tilt_tier == "low" and j_tier != "high" and s_tier != "high":
         return "pressed/tense"
 
-    # Isolated elevated perturbation leans harsh / creaky
-    if j_tier == "high" or s_tier == "high":
-        return "harsh/creaky"
-
-    # 4. Modal / Normal: Balanced phonation
+    # 4. Modal / Normal: Balanced phonation (fallback)
     return "modal/normal"
 
 
@@ -255,7 +251,7 @@ def score_voice_quality_piece(
 ) -> float:
     """Computes the reward score for the Voice Quality dimension.
 
-    Calibrated via square-root smoothed inverse frequency:
+    Calibrated via inverse frequency:
       - Match: calibrated weight w_vq(truth_quality) in (0.0, 1.0].
       - Mismatch / Missing / None: 0.0.
     """
@@ -273,14 +269,14 @@ def score_voice_quality_piece(
 
     # Fallback when weights are not calibrated
     if t == "modal/normal":
-        return 0.7071
+        return 0.5
     return 1.0
 
 
 def compute_acoustic_cue_weights(
     train_df: pd.DataFrame,
     quantiles_dict: Dict[str, Dict[str, Dict[str, float]]],
-    power: float = 0.5,
+    power: float = 1.0,
     cues_map: Dict[str, str] = CUE_FEATURE_MAP,
     vq_map: Dict[str, str] = VOICE_QUALITY_FEATURE_MAP,
 ) -> Dict[str, Dict[str, float]]:
@@ -346,20 +342,23 @@ def compute_acoustic_cue_weights(
 
         if total_valid == 0:
             for cat in cat_counts:
-                weights_dict[cue_name][cat] = 0.7071 if cat in ("moderate", "modal/normal") else 1.0
+                weights_dict[cue_name][cat] = 0.5 if cat in ("moderate", "modal/normal") else 1.0
             continue
 
-        num_cats = len(cat_counts)
         freqs = {
-            cat: (cnt + 1) / (total_valid + num_cats)
+            cat: cnt / total_valid
             for cat, cnt in cat_counts.items()
+            if cnt > 0
         }
 
-        raw_inv = {cat: (1.0 / f) ** power for cat, f in freqs.items()}
-        max_inv = max(raw_inv.values())
+        raw_inv = {
+            cat: (1.0 / freqs[cat]) ** power if cat in freqs else 0.0
+            for cat in cat_counts
+        }
+        max_inv = max(raw_inv.values()) if raw_inv else 1.0
 
         for cat, inv_val in raw_inv.items():
-            weights_dict[cue_name][cat] = round(float(inv_val / max_inv), 4)
+            weights_dict[cue_name][cat] = round(float(inv_val / max_inv), 6) if max_inv > 0 else 0.0
 
     return weights_dict
 
@@ -373,11 +372,13 @@ class AcousticInventoryReward:
         weights_ref: Optional[Dict[str, Dict[str, float]]] = None,
         audio_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
         normalize: bool = False,
+        normalize_by_max_possible: bool = False,
     ):
         self.quantiles_ref = quantiles_ref or {}
         self.weights_ref = weights_ref or {}
         self.audio_lookup = audio_lookup or {}
         self.normalize = normalize
+        self.normalize_by_max_possible = normalize_by_max_possible
 
     def set_quantiles(self, quantiles_ref: Dict[str, Dict[str, Dict[str, float]]]) -> None:
         """Update active speaker quantiles reference."""
@@ -395,14 +396,16 @@ class AcousticInventoryReward:
         self,
         prompts: List[str],
         completions: List[str],
+        return_gate_scores: bool = False,
         **kwargs: Any,
-    ) -> List[float]:
+    ) -> Any:
         """Compute R2 acoustic inventory rewards for a batch of GRPO rollouts.
 
         Returns:
-            List of float rewards per completion.
+            List of float rewards per completion (or tuple (rewards, gate_rewards) if return_gate_scores=True).
         """
         rewards: List[float] = []
+        gate_rewards: List[float] = []
 
         speakers = kwargs.get("speaker", [None] * len(completions))
         audio_paths = kwargs.get("audio_path", [None] * len(completions))
@@ -427,6 +430,7 @@ class AcousticInventoryReward:
             )
 
             cue_scores: Dict[str, float] = {}
+            cue_max_scores: Dict[str, float] = {}
 
             # 1. Evaluate 4 continuous physical acoustic dimensions
             for cue_name, feat_col in CUE_FEATURE_MAP.items():
@@ -460,6 +464,9 @@ class AcousticInventoryReward:
                 cue_scores[cue_name] = score_acoustic_piece(
                     truth_tier, pred_tier, cue_name=cue_name, weights_dict=active_weights
                 )
+                cue_max_scores[cue_name] = score_acoustic_piece(
+                    truth_tier, truth_tier, cue_name=cue_name, weights_dict=active_weights
+                )
 
             # 2. Evaluate composite Voice Quality (Jitter, Shimmer, HNR, Hammarberg)
             vq_vals = {}
@@ -489,14 +496,26 @@ class AcousticInventoryReward:
                 cue_scores["voice_quality"] = score_voice_quality_piece(
                     truth_vq, pred_vq, weights_dict=active_weights
                 )
+                cue_max_scores["voice_quality"] = score_voice_quality_piece(
+                    truth_vq, truth_vq, weights_dict=active_weights
+                )
 
             if cue_scores:
                 total = sum(cue_scores.values())
-                score = (total / len(cue_scores)) if self.normalize else total
-                rewards.append(round(float(score), 3))
+                max_total = sum(cue_max_scores.values())
+                gate_score = (total / max_total) if max_total > 0 else 0.0
+                if self.normalize_by_max_possible:
+                    score = gate_score if self.normalize else (gate_score * len(cue_scores))
+                else:
+                    score = (total / len(cue_scores)) if self.normalize else total
+                rewards.append(round(float(score), 4))
+                gate_rewards.append(round(float(gate_score), 4))
             else:
                 rewards.append(0.0)
+                gate_rewards.append(0.0)
 
+        if return_gate_scores:
+            return rewards, gate_rewards
         return rewards
 
 
@@ -507,13 +526,16 @@ def reward_acoustic_inventory(
     weights_ref: Optional[Dict[str, Dict[str, float]]] = None,
     audio_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
     normalize: bool = False,
+    normalize_by_max_possible: bool = False,
+    return_gate_scores: bool = False,
     **kwargs: Any,
-) -> List[float]:
+) -> Any:
     """Functional wrapper for AcousticInventoryReward."""
     rewarder = AcousticInventoryReward(
         quantiles_ref=quantiles_ref,
         weights_ref=weights_ref,
         audio_lookup=audio_lookup,
         normalize=normalize,
+        normalize_by_max_possible=normalize_by_max_possible,
     )
-    return rewarder(prompts, completions, **kwargs)
+    return rewarder(prompts, completions, return_gate_scores=return_gate_scores, **kwargs)

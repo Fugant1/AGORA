@@ -18,24 +18,18 @@ def unified_gated_grpo_reward(
     w_r1: float = 1.5,
     w_r2: float = 1.0,
     w_r3: float = 0.2,
-    normalize_weights: bool = True,
+    gate_floor: float = 0.15,
+    normalize_weights: bool = False,
     scale_r2_to_unit: bool = True,
     r1_reward_func: Optional[Callable] = None,
     r2_reward_func: Optional[Callable] = None,
     r3_reward_func: Optional[Callable] = None,
     **kwargs: Any,
 ) -> List[float]:
-    """Computes the unified GRPO reward as a normalized weighted sum of R1, R2, and R3.
-
-    Completions are parsed once and cached across R1, R2, and R3.
-
-    Weights:
-      - R1 (Class-Weighted Accuracy): 1.5
-      - R2 (Acoustic Inventory Grounding): 1.0
-      - R3 (Format & CoT Structure): 0.2
+    """Computes the unified GRPO reward with causal soft-gating normalized by per-sample R2_max.
 
     Formula:
-      R_unified = (1.5 * R1 + 1.0 * R2_norm + 0.2 * R3) / (1.5 + 1.0 + 0.2)
+      R_unified = w_r1 * [R1 * (gate_floor + (1 - gate_floor) * R2_gate)] + w_r2 * R2 + w_r3 * R3
     """
     if "parsed_completions" not in kwargs:
         kwargs["parsed_completions"] = [parse_completion(c) for c in completions]
@@ -48,9 +42,20 @@ def unified_gated_grpo_reward(
         r1_scores = [1.0] * len(completions)
 
     if r2_reward_func is not None:
-        r2_scores = r2_reward_func(prompts, completions, **kwargs)
+        try:
+            r2_out = r2_reward_func(prompts, completions, return_gate_scores=True, **kwargs)
+            if isinstance(r2_out, tuple) and len(r2_out) == 2:
+                r2_scores, r2_gate_scores = r2_out
+            else:
+                r2_scores = r2_out
+                r2_gate_scores = r2_out
+        except TypeError:
+            r2_scores = r2_reward_func(prompts, completions, **kwargs)
+            r2_gate_scores = r2_scores
     else:
-        r2_scores = reward_acoustic_inventory(prompts, completions, normalize=True, **kwargs)
+        r2_scores, r2_gate_scores = reward_acoustic_inventory(
+            prompts, completions, normalize=True, return_gate_scores=True, **kwargs
+        )
 
     if r3_reward_func is not None:
         r3_scores = r3_reward_func(prompts, completions, **kwargs)
@@ -60,12 +65,16 @@ def unified_gated_grpo_reward(
     total_weight = (w_r1 + w_r2 + w_r3) if normalize_weights else 1.0
 
     unified_scores: List[float] = []
-    for r1, r2, r3 in zip(r1_scores, r2_scores, r3_scores):
+    for r1, r2, r2_gate, r3 in zip(r1_scores, r2_scores, r2_gate_scores, r3_scores):
         r1_val = float(r1)
-        r2_val = float(r2)
-        r3_val = float(r3)
+        r2_val = max(0.0, min(1.0, float(r2)))
+        r2_gate_val = max(0.0, min(1.0, float(r2_gate)))
+        r3_val = max(0.0, min(1.0, float(r3)))
 
-        total = (w_r1 * r1_val + w_r2 * r2_val + w_r3 * r3_val) / total_weight
+        causal_gate = gate_floor + (1.0 - gate_floor) * r2_gate_val
+        gated_r1 = r1_val * causal_gate
+
+        total = (w_r1 * gated_r1 + w_r2 * r2_val + w_r3 * r3_val) / total_weight
         unified_scores.append(round(float(total), 4))
 
     return unified_scores
