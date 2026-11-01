@@ -553,6 +553,96 @@ class TestGRPORewardMathematics(unittest.TestCase):
             msg=f"Acoustic gamble overrode emotion accuracy: u_emo_hit={u_emo_hit} <= u_emo_miss={u_emo_miss}",
         )
 
+    def test_10_voice_quality_preserves_balanced_sft_decision(self) -> None:
+        """Fix 1B: a balanced-SFT model emits L_k (uniform-prior likelihood). On grpo_train_set the true
+        posterior is P_real ∝ f_k L_k. GRPO must keep argmax_k L_k for EVERY L (no prior re-injection),
+        while keeping E[s_vq | blind guess] == 0 and all scores inside [-1, +1]."""
+        score_cue = self.env["score_cue_zero_mean"]
+        for priors in (
+            {"modal/normal": 0.4225, "breathy": 0.2197, "harsh/creaky": 0.2064, "pressed/tense": 0.1515},
+            {"modal/normal": 0.60, "breathy": 0.15, "harsh/creaky": 0.10, "pressed/tense": 0.15},
+        ):
+            pri = {"voice_quality": priors}
+            classes = list(priors)
+            f = np.array([priors[k] for k in classes])
+            S = np.array([[score_cue(t, p, "voice_quality", pri)[0] for p in classes] for t in classes])
+
+            np.testing.assert_allclose(f @ S, 0.0, atol=1e-12)          # blind guess
+            self.assertLessEqual(S.max(), 1.0 + 1e-12)                    # no clipping in R2
+            self.assertGreaterEqual(S.min(), -1.0)
+
+            rng = np.random.default_rng(0)
+            L = rng.dirichlet([2.0] * 4, size=50_000)
+            P = f * L
+            P /= P.sum(axis=1, keepdims=True)
+            agreement = float(((P @ S).argmax(1) == L.argmax(1)).mean())
+            self.assertEqual(agreement, 1.0, msg=f"GRPO overrides balanced SFT on VQ ({agreement:.4%}) for {priors}")
+
+        # Regression: the reverted gamma=0.55 rule and the original rule both fail this property
+        f = np.array([0.4225, 0.2197, 0.2064, 0.1515])
+        L = np.random.default_rng(1).dirichlet([2.0] * 4, size=50_000)
+        P = f * L
+        P /= P.sum(axis=1, keepdims=True)
+        for gamma in (0.0, 0.55):
+            m = (f / 0.25) ** gamma
+            S_old = -np.tile(m * f, (4, 1))
+            S_old[np.arange(4), np.arange(4)] = m * (1 - f)
+            self.assertLess(float(((P @ S_old).argmax(1) == L.argmax(1)).mean()), 0.95)
+
+    def test_11_r_unified_emotion_invariance_at_high_sft_r2(self) -> None:
+        """Validates Fix 3 post-SFT: when the model has high acoustic accuracy (R2 > 0.50), no emotion is favored."""
+        unified_reward = self.env["unified_gated_grpo_reward"]
+
+        tier_to_prompt_opt = {
+            "pitch_height": {"low": "low", "moderate": "moderate", "high": "elevated"},
+            "pitch_dynamics": {"low": "narrow", "moderate": "moderate", "high": "wide"},
+            "vocal_energy": {"low": "quiet", "moderate": "moderate", "high": "loud"},
+            "speaking_rate": {"low": "slow", "moderate": "moderate", "high": "fast"},
+        }
+
+        grid_labels: List[str] = []
+        grid_kwargs: Dict[str, List[Any]] = {"speaker": []}
+        for col in self.ALL_ACOUSTIC_FEATURES.values():
+            grid_kwargs[col] = []
+
+        for emo_t in self.emotion_samples:
+            for ac_row in self.acoustic_samples:
+                grid_labels.append(emo_t)
+                grid_kwargs["speaker"].append(ac_row["speaker"])
+                for col in self.ALL_ACOUSTIC_FEATURES.values():
+                    grid_kwargs[col].append(ac_row[col])
+
+        grid_prompts = ["prompt"] * len(grid_labels)
+
+        # Evaluate expected R_unified for each emotion when acoustics are Oracle (R2 > 0.85, simulating SFT model)
+        sft_emo_means = {}
+        for blind_emo in self.VALID_EMOTIONS:
+            oracle_ac_comps = []
+            for _emo_t in self.emotion_samples:
+                for ac_row in self.acoustic_samples:
+                    t_c = ac_row["truth_tier"]
+                    t_vq = ac_row["truth_vq"]
+                    oracle_ac_comps.append(
+                        self.build_completion(
+                            tier_to_prompt_opt["pitch_height"][t_c],
+                            tier_to_prompt_opt["pitch_dynamics"][t_c],
+                            tier_to_prompt_opt["vocal_energy"][t_c],
+                            tier_to_prompt_opt["speaking_rate"][t_c],
+                            t_vq,
+                            emotion=blind_emo,
+                        )
+                    )
+            scores = unified_reward(grid_prompts, oracle_ac_comps, label=grid_labels, **grid_kwargs)
+            sft_emo_means[blind_emo] = float(np.mean(scores))
+
+        spread = max(sft_emo_means.values()) - min(sft_emo_means.values())
+        self.assertAlmostEqual(
+            spread,
+            0.0,
+            places=9,
+            msg=f"Post-SFT emotion bias when R2 > 0.50! Spread={spread}, means={sft_emo_means}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
