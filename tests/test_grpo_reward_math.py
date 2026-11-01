@@ -452,6 +452,107 @@ class TestGRPORewardMathematics(unittest.TestCase):
         for val in u_mat_vals:
             self.assertAlmostEqual(float(val), 0.70, places=6)
 
+    def test_8_posterior_map_consistency_and_slope_parity_anti_moderate_collapse(self) -> None:
+        """Validates that Fix 1 has 1:1 marginal slope parity and prevents moderate collapse under posterior beliefs."""
+        get_mat = self.env["get_ordinal_cue_payoff_matrix"]
+        quartile_priors = {"low": 0.25, "moderate": 0.50, "high": 0.25}
+        mat = get_mat(quartile_priors)
+
+        # Extract matrix parameters: e = S[mod][mod], b = -S[mod][low], c = -S[high][low]
+        e_hit = mat["moderate"]["moderate"]
+        b_adj = -mat["moderate"]["low"]
+        c_opp = -mat["high"]["low"]
+
+        # 1. Check marginal lift slope parity: dE[S|mod]/dp_M = 2*e >= dE[S|low]/dp_L = 3*b + c
+        slope_moderate = 2.0 * e_hit
+        slope_extreme = 3.0 * b_adj + c_opp
+        self.assertGreaterEqual(
+            slope_moderate + 1e-9,
+            slope_extreme,
+            msg=f"Slope bias against moderate: 2e={slope_moderate:.4f} < 3b+c={slope_extreme:.4f}",
+        )
+
+        # 2. Under a moderate-dominant posterior P = (0.28 low, 0.58 mod, 0.14 high),
+        # predicting 'moderate' MUST strictly beat gambling on 'low' or 'high'
+        posterior = {"low": 0.28, "moderate": 0.58, "high": 0.14}
+        exp_scores = {
+            pred: sum(posterior[truth] * mat[truth][pred] for truth in ("low", "moderate", "high"))
+            for pred in ("low", "moderate", "high")
+        }
+        self.assertGreater(
+            exp_scores["moderate"],
+            exp_scores["low"],
+            msg=f"Moderate collapsed under posterior {posterior}: E[mod]={exp_scores['moderate']} <= E[low]={exp_scores['low']}",
+        )
+        self.assertGreater(exp_scores["low"], exp_scores["high"])
+
+        # 3. Regression check: prove that this test catches the old distorted matrix (e=0.40, b=0.20, c=0.55)
+        old_mat = {
+            "low": {"low": 0.95, "moderate": -0.40, "high": -0.55},
+            "moderate": {"low": -0.20, "moderate": 0.40, "high": -0.20},
+            "high": {"low": -0.55, "moderate": -0.40, "high": 0.95},
+        }
+        old_exp_mod = sum(posterior[t] * old_mat[t]["moderate"] for t in ("low", "moderate", "high"))
+        old_exp_low = sum(posterior[t] * old_mat[t]["low"] for t in ("low", "moderate", "high"))
+        self.assertLess(
+            old_exp_mod,
+            old_exp_low,
+            msg="Regression check failed: old matrix should fail posterior MAP consistency",
+        )
+
+    def test_9_unshrunk_r1_penalty_and_emotion_gradient_dominance(self) -> None:
+        """Validates that Fix 3 preserves 100% of R1 emotion miss penalties and R1 hit scale at R2=0.50."""
+        unified_reward = self.env["unified_gated_grpo_reward"]
+        reward_r1 = self.env["reward_label_accuracy_weighted"]
+        reward_r2 = self.env["reward_acoustic_inventory"]
+        reward_r3 = self.env["reward_format"]
+
+        sample_kw = {
+            "label": ["anger"],
+            "speaker": ["SampleSpeaker"],
+            self.CUE_FEATURE_MAP["pitch_height"]: [self.cont_values["pitch_height"]["low"]],
+            self.CUE_FEATURE_MAP["pitch_dynamics"]: [self.cont_values["pitch_dynamics"]["low"]],
+            self.CUE_FEATURE_MAP["vocal_energy"]: [self.cont_values["vocal_energy"]["low"]],
+            self.CUE_FEATURE_MAP["speaking_rate"]: [self.cont_values["speaking_rate"]["low"]],
+            self.VOICE_QUALITY_FEATURE_MAP["jitter"]: [self.vq_values["harsh/creaky"]["jitter"]],
+            self.VOICE_QUALITY_FEATURE_MAP["shimmer"]: [self.vq_values["harsh/creaky"]["shimmer"]],
+            self.VOICE_QUALITY_FEATURE_MAP["hnr"]: [self.vq_values["harsh/creaky"]["hnr"]],
+            self.VOICE_QUALITY_FEATURE_MAP["hammarberg"]: [self.vq_values["harsh/creaky"]["hammarberg"]],
+        }
+
+        # 1. For every wrong emotion prediction (R1 < 0), R_unified must apply 100% of w_r1 * R1 (not 0.575 * R1)
+        for wrong_emo in self.VALID_EMOTIONS:
+            if wrong_emo == "anger":
+                continue
+            comp_miss = self.build_completion("low", "narrow", "quiet", "slow", "harsh/creaky", wrong_emo)
+            r1_val = reward_r1(["p"], [comp_miss], label=["anger"])[0]
+            r2_val = reward_r2(["p"], [comp_miss], **sample_kw)[0]
+            r3_val = reward_r3(["p"], [comp_miss])[0]
+            u_val = unified_reward(["p"], [comp_miss], **sample_kw)[0]
+
+            expected_unshrunk = 1.5 * r1_val + 1.0 * r2_val + 0.2 * r3_val
+            self.assertAlmostEqual(
+                u_val,
+                expected_unshrunk,
+                places=9,
+                msg=f"R1 miss penalty for '{wrong_emo}' was shrunk! Got {u_val}, expected {expected_unshrunk}",
+            )
+
+        # 2. Emotion hit vs miss must dominate single-cue acoustic gambles in R_unified
+        comp_emo_hit_mod_ac = self.build_completion(
+            "moderate", "moderate", "moderate", "moderate", "modal/normal", "anger"
+        )
+        comp_emo_miss_oracle_ac = self.build_completion(
+            "low", "narrow", "quiet", "slow", "harsh/creaky", "neutral"
+        )
+        u_emo_hit = unified_reward(["p"], [comp_emo_hit_mod_ac], **sample_kw)[0]
+        u_emo_miss = unified_reward(["p"], [comp_emo_miss_oracle_ac], **sample_kw)[0]
+        self.assertGreater(
+            u_emo_hit,
+            u_emo_miss,
+            msg=f"Acoustic gamble overrode emotion accuracy: u_emo_hit={u_emo_hit} <= u_emo_miss={u_emo_miss}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
