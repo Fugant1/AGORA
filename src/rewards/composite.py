@@ -15,7 +15,7 @@ from src.rewards.parser import parse_completion
 def unified_gated_grpo_reward(
     prompts: List[str],
     completions: List[str],
-    w_r1: float = 1.5,
+    w_r1: float = 1.0,
     w_r2: float = 1.0,
     w_r3: float = 0.2,
     gate_floor: float = 0.15,
@@ -24,12 +24,16 @@ def unified_gated_grpo_reward(
     r1_reward_func: Optional[Callable] = None,
     r2_reward_func: Optional[Callable] = None,
     r3_reward_func: Optional[Callable] = None,
+    use_causal_gate: bool = False,
     **kwargs: Any,
 ) -> List[float]:
-    """Computes the unified GRPO reward with causal soft-gating normalized by per-sample R2_max.
+    """Computes the unified GRPO reward via Pure Linear Additive Scalarization (Option 1).
 
-    Formula:
-      R_unified = w_r1 * [R1 * (gate_floor + (1 - gate_floor) * R2_gate)] + w_r2 * R2 + w_r3 * R3
+    Formula (Option 1 - Anti-Reward Hacking / DeepSeek-R1 style):
+      R_unified = (w_r1 * R1 + w_r2 * R2 + w_r3 * R3) / total_weight
+
+    Decouples acoustic and emotion gradients, eliminating the multiplicative gate amplification
+    that induced runaway high-arousal mode collapse.
     """
     if "parsed_completions" not in kwargs:
         kwargs["parsed_completions"] = [parse_completion(c) for c in completions]
@@ -71,10 +75,13 @@ def unified_gated_grpo_reward(
         r2_gate_val = max(0.0, min(1.0, float(r2_gate)))
         r3_val = max(0.0, min(1.0, float(r3)))
 
-        causal_gate = gate_floor + (1.0 - gate_floor) * r2_gate_val
-        gated_r1 = r1_val * causal_gate
+        if use_causal_gate:
+            causal_gate = gate_floor + (1.0 - gate_floor) * r2_gate_val
+            acc_term = w_r1 * r1_val * causal_gate
+        else:
+            acc_term = w_r1 * r1_val
 
-        total = (w_r1 * gated_r1 + w_r2 * r2_val + w_r3 * r3_val) / total_weight
+        total = (acc_term + w_r2 * r2_val + w_r3 * r3_val) / total_weight
         unified_scores.append(round(float(total), 4))
 
     return unified_scores
@@ -111,11 +118,12 @@ class RewardManager:
 
     def get_unified_reward_function(
         self,
-        w_r1: float = 1.5,
+        w_r1: float = 1.0,
         w_r2: float = 1.0,
         w_r3: float = 0.2,
         normalize_weights: bool = True,
         scale_r2_to_unit: bool = True,
+        use_causal_gate: bool = False,
     ) -> Callable:
         """Returns a single unified reward function computing the normalized weighted sum of R1, R2, R3."""
         def _unified_reward(prompts: List[str], completions: List[str], **kwargs: Any) -> List[float]:
@@ -130,6 +138,7 @@ class RewardManager:
                 r1_reward_func=self.r1_accuracy,
                 r2_reward_func=self.r2_acoustic,
                 r3_reward_func=self.r3_format,
+                use_causal_gate=use_causal_gate,
                 **kwargs,
             )
 
