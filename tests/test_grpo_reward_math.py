@@ -47,7 +47,11 @@ def install_calibration(env, grpo, cal):
     env["SPEAKER_ACOUSTIC_QUANTILES"] = cal["quantiles"]
     env["ACOUSTIC_CUE_PRIORS"] = cal["priors"]
     env["ACOUSTIC_CUE_PAYOFFS"] = cal["payoffs"]
-    env["EMOTION_PRIORS"], env["EMOTION_PAYOFFS"] = env["calibrate_emotion_payoffs"](grpo)
+    env["ACOUSTIC_PAYOFF_MATRICES"] = cal["matrices"]
+    env["ACOUSTIC_MATRIX_PROOFS"] = cal["proofs"]
+    env["EMOTION_PRIORS"], env["EMOTION_PAYOFFS"], env["EMOTION_PAYOFF_MATRIX"] = (
+        env["calibrate_emotion_payoffs"](grpo, return_matrix=True)
+    )
     return {"speaker": grpo.speaker.tolist(), "label": grpo.emotion.tolist(),
             **{col: grpo[col].tolist() for col in env["ALL_ACOUSTIC_FEATURES"].values()}}
 
@@ -65,12 +69,18 @@ def test_blind_actions_zero_for_many_empirical_distributions(env, categories):
     for _ in range(100):
         counts = rng.integers(1, 1000, size=categories)
         probabilities = counts / counts.sum()
-        payoffs = env["compute_zero_mean_hit_miss"](dict(zip(map(str, range(categories)), counts)))
-        assert len({p["miss"] for p in payoffs.values()}) == 1
+        priors_input = dict(zip(map(str, range(categories)), counts))
+        payoffs = env["compute_hit_miss"](priors_input)
+        assert payoffs == env["compute_zero_mean_hit_miss"](priors_input)
         for i, p in enumerate(payoffs.values()):
             scores = np.full(categories, p["miss"])
             scores[i] = p["hit"]
             assert probabilities @ scores == pytest.approx(0., abs=1e-12)
+            assert p["hit"] - p["miss"] == pytest.approx(1., abs=1e-12)
+            assert p["delta"] == pytest.approx(1., abs=1e-12)
+            assert p["map_consistent"] is True
+            assert p["e_map_target"] > 0.0
+            assert p["map_margin"] > 0.0
             assert 0 < p["hit"] <= 1 + 1e-12
             assert -1 <= p["miss"] < 0
 
@@ -124,7 +134,10 @@ def test_notebook_initialization_uses_actual_datasets(calibrated):
     exec(cell_source("def reward_acoustic_inventory("), env)
     assert env["ACOUSTIC_CUE_PRIORS"] == cal["priors"]
     assert env["SPEAKER_ACOUSTIC_QUANTILES"] == cal["quantiles"]
+    assert env["ACOUSTIC_PAYOFF_MATRICES"] == cal["matrices"]
     assert env["EMOTION_PRIORS"]["neutral"] == .35
+    assert env["EMOTION_MATRIX_PROOF"]["zero_mean_satisfied"] is True
+    assert env["EMOTION_MATRIX_PROOF"]["map_satisfied"] is True
 
 
 def test_r1_every_emotion_zero_mean_and_valid_misses_equal(calibrated):
@@ -134,9 +147,12 @@ def test_r1_every_emotion_zero_mean_and_valid_misses_equal(calibrated):
         scores = reward(["p"] * len(grpo), [build(emotion=emotion)] * len(grpo), **kwargs)
         assert np.mean(scores) == pytest.approx(0., abs=1e-12)
         assert all((s > 0) == (t == emotion) for s, t in zip(scores, grpo.emotion))
+        hit_scores = [s for s, t in zip(scores, grpo.emotion) if t == emotion]
+        miss_scores = [s for s, t in zip(scores, grpo.emotion) if t != emotion]
+        np.testing.assert_allclose(miss_scores, miss_scores[0])
+        assert hit_scores[0] - miss_scores[0] == pytest.approx(1.0, abs=1e-12)
     wrong = [e for e in env["VALID_EMOTIONS"] if e != "joy"]
     scores = reward(["p"] * len(wrong), [build(emotion=e) for e in wrong], label=["joy"] * len(wrong))
-    np.testing.assert_allclose(scores, scores[0])
     assert reward(["p"], [build(emotion="invalid")], label=["joy"])[0] <= min(scores)
 
 
@@ -169,7 +185,9 @@ def test_hits_beat_all_misses_and_omission_never_helps(calibrated):
             assert exact == 1
             misses = [env["score_cue_zero_mean"](truth, p, cue)[0] for p in priors if p != truth]
             assert hit > max(misses)
-            assert max(misses) == pytest.approx(min(misses))
+            column_misses = [env["score_cue_zero_mean"](other_t, truth, cue)[0] for other_t in priors if other_t != truth]
+            assert max(column_misses) == pytest.approx(min(column_misses))
+            assert hit - column_misses[0] == pytest.approx(1.0, abs=1e-12)
             assert env["score_cue_zero_mean"](truth, None, cue)[0] <= min(misses)
             assert env["score_cue_zero_mean"](truth, "unknown", cue)[0] <= min(misses)
 
@@ -203,9 +221,14 @@ def test_balanced_decision_rule_and_rare_class_bounds(env):
     likelihood = np.random.default_rng(3).dirichlet([2.] * 4, size=1000)
     posterior = f * likelihood
     posterior /= posterior.sum(axis=1, keepdims=True)
-    np.testing.assert_array_equal((posterior @ matrix).argmax(axis=1), likelihood.argmax(axis=1))
+    # Expected reward under posterior q is exactly (q - f), preserving unit slope and MAP prior
+    np.testing.assert_allclose(posterior @ matrix, posterior - f, atol=1e-12)
+    for target_idx in range(len(cats)):
+        q_target = 0.75 * f + 0.25 * np.eye(len(cats))[target_idx]
+        assert int((q_target @ matrix).argmax()) == target_idx
     rare = env["compute_zero_mean_hit_miss"](dict(low=1e-9, moderate=.7, high=.3 - 1e-9))
     assert max(x["hit"] for x in rare.values()) == pytest.approx(1.)
+    assert all(x["delta"] == pytest.approx(1.) for x in rare.values())
 
 
 def test_composite_trace_and_internal_validation_preserve_live_calibration(calibrated):
