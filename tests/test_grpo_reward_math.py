@@ -1,646 +1,225 @@
-"""Mathematical validation tests for the GRPO reward system in ser_grpo_v2.ipynb.
-
-Validates Fix 1, Fix 2, and Fix 3 both in isolation (R1, per-cue s_c, R2, R3)
-and combined in R_unified using sample physical eGeMAPS values and XML completions:
-  - Fix 1: Quartile-Preserving (25% / 50% / 25%) Ordinal Zero-Mean Payoff Matrix
-           for the 4 continuous prosodic cues + Zero-Mean categorical voice_quality.
-  - Fix 2: Constant-denominator affine normalization (R2_NORM_SCALE = 2.0) in R2,
-           eliminating Jensen's inequality / random-denominator bias.
-  - Fix 3: Zero-Mean Soft-Causal Gating in unified_gated_grpo_reward (R_unified),
-           ensuring no emotion or acoustic cue class has any blind-guess advantage.
-"""
-
-import json
-from pathlib import Path
-import unittest
-from typing import Any, Dict, List
+"""Empirical invariants against actual reward code in ser_grpo_v2.ipynb."""
+from itertools import product
 import numpy as np
 import pandas as pd
-
-
-def load_notebook_reward_env() -> Dict[str, Any]:
-    """Loads and executes the reward cells from ser_grpo_v2.ipynb in an isolated namespace."""
-    nb_path = Path(__file__).resolve().parent.parent / "ser_grpo_v2.ipynb"
-    with open(nb_path, "r", encoding="utf-8") as f:
-        nb = json.load(f)
-
-    env: Dict[str, Any] = {
-        "VALID_EMOTIONS": {
-            "anger",
-            "disgust",
-            "fear",
-            "joy",
-            "neutral",
-            "sadness",
-            "surprise",
-        },
-        "cot_prompt": "Analyze the speaker's acoustic cues and deduce the emotion.",
-        "display": lambda *args, **kwargs: None,
-    }
-
-    # Execute cells 51-57 (parsers), 61 (R1), 63 (R2), 65 (R3), 67 (R_unified)
-    for cell_idx in [51, 52, 53, 54, 55, 56, 57, 61, 63, 65, 67]:
-        code = "".join(nb["cells"][cell_idx]["source"])
-        exec(compile(code, f"<ser_grpo_v2_cell_{cell_idx}>", "exec"), env)
-
-    # Also load INVENTORY_DIMENSIONS and evaluate_single_prompt_acoustics from cell 96 via AST
-    import ast
-    cell_96_src = "".join(nb["cells"][96]["source"])
-    tree_96 = ast.parse(cell_96_src)
-    kept_nodes = [
-        node
-        for node in tree_96.body
-        if (isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "INVENTORY_DIMENSIONS")
-        or (isinstance(node, ast.FunctionDef) and node.name == "evaluate_single_prompt_acoustics")
-    ]
-    mod_96 = ast.Module(body=kept_nodes, type_ignores=[])
-    exec(compile(mod_96, "<ser_grpo_v2_cell_96>", "exec"), env)
-
-    return env
-
-
-class TestGRPORewardMathematics(unittest.TestCase):
-    """Tests isolated and combined GRPO reward functions with sample values."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.env = load_notebook_reward_env()
-        cls.CUE_FEATURE_MAP = cls.env["CUE_FEATURE_MAP"]
-        cls.VOICE_QUALITY_FEATURE_MAP = cls.env["VOICE_QUALITY_FEATURE_MAP"]
-        cls.ALL_ACOUSTIC_FEATURES = cls.env["ALL_ACOUSTIC_FEATURES"]
-        cls.R2_NORM_SCALE = cls.env["R2_NORM_SCALE"]
-        cls.VALID_EMOTIONS = sorted(cls.env["VALID_EMOTIONS"])
-
-        # Sample speaker quantiles (Q25 and Q75) representing scientific quartile boundaries
-        cls.sample_quantiles = {
-            "SampleSpeaker": {
-                "pitch_height": {"q25": 28.0, "q75": 34.0},
-                "pitch_dynamics": {"q25": 5.0, "q75": 11.0},
-                "vocal_energy": {"q25": 0.40, "q75": 0.90},
-                "speaking_rate": {"q25": 2.20, "q75": 3.60},
-                "jitter": {"q25": 0.015, "q75": 0.035},
-                "shimmer": {"q25": 0.80, "q75": 1.60},
-                "hnr": {"q25": 4.0, "q75": 9.0},
-                "hammarberg": {"q25": 12.0, "q75": 20.0},
-            }
-        }
-        cls.sample_quantiles["__GLOBAL__"] = cls.sample_quantiles["SampleSpeaker"]
-
-        # Sample physical values falling strictly inside Low (<= Q25), Moderate (Q25..Q75), High (> Q75)
-        cls.cont_values = {
-            "pitch_height": {"low": 24.0, "moderate": 31.0, "high": 38.0},
-            "pitch_dynamics": {"low": 3.0, "moderate": 8.0, "high": 15.0},
-            "vocal_energy": {"low": 0.25, "moderate": 0.65, "high": 1.25},
-            "speaking_rate": {"low": 1.60, "moderate": 2.90, "high": 4.30},
-        }
-        cls.vq_values = {
-            "modal/normal": {"jitter": 0.025, "shimmer": 1.20, "hnr": 6.5, "hammarberg": 16.0},
-            "pressed/tense": {"jitter": 0.025, "shimmer": 1.20, "hnr": 6.5, "hammarberg": 8.0},
-            "breathy": {"jitter": 0.025, "shimmer": 1.20, "hnr": 6.5, "hammarberg": 24.0},
-            "harsh/creaky": {"jitter": 0.050, "shimmer": 2.10, "hnr": 2.5, "hammarberg": 16.0},
-        }
-
-        # Scientific Quartile cycle: 25% low, 50% moderate, 25% high (N=20 samples)
-        cls.quartile_cycle = ["low", "moderate", "moderate", "high"]
-        cls.vq_cycle = (
-            ["modal/normal"] * 12
-            + ["pressed/tense"] * 3
-            + ["breathy"] * 3
-            + ["harsh/creaky"] * 2
-        )
-
-        cls.acoustic_samples: List[Dict[str, Any]] = []
-        for i in range(20):
-            t_tier = cls.quartile_cycle[i % 4]
-            t_vq = cls.vq_cycle[i]
-            cls.acoustic_samples.append({
-                "audio_path": f"sample_{i}.wav",
-                "speaker": "SampleSpeaker",
-                "truth_tier": t_tier,
-                "truth_vq": t_vq,
-                cls.CUE_FEATURE_MAP["pitch_height"]: cls.cont_values["pitch_height"][t_tier],
-                cls.CUE_FEATURE_MAP["pitch_dynamics"]: cls.cont_values["pitch_dynamics"][t_tier],
-                cls.CUE_FEATURE_MAP["vocal_energy"]: cls.cont_values["vocal_energy"][t_tier],
-                cls.CUE_FEATURE_MAP["speaking_rate"]: cls.cont_values["speaking_rate"][t_tier],
-                cls.VOICE_QUALITY_FEATURE_MAP["jitter"]: cls.vq_values[t_vq]["jitter"],
-                cls.VOICE_QUALITY_FEATURE_MAP["shimmer"]: cls.vq_values[t_vq]["shimmer"],
-                cls.VOICE_QUALITY_FEATURE_MAP["hnr"]: cls.vq_values[t_vq]["hnr"],
-                cls.VOICE_QUALITY_FEATURE_MAP["hammarberg"]: cls.vq_values[t_vq]["hammarberg"],
-            })
-
-        cls.df_acoustic = pd.DataFrame(cls.acoustic_samples)
-
-        # Imbalanced sample emotion distribution (N=20 samples)
-        cls.emotion_counts = {
-            "neutral": 7,
-            "joy": 4,
-            "anger": 3,
-            "sadness": 2,
-            "fear": 2,
-            "disgust": 1,
-            "surprise": 1,
-        }
-        cls.emotion_samples = [
-            emo for emo, cnt in cls.emotion_counts.items() for _ in range(cnt)
-        ]
-        cls.df_emotions = pd.DataFrame({"emotion": cls.emotion_samples})
-
-        # Calibrate priors using the actual notebook functions
-        cls.emo_priors, cls.emo_weights = cls.env["compute_emotion_priors_and_weights"](
-            cls.df_emotions, power=0.35
-        )
-        cls.cue_priors = cls.env["compute_acoustic_cue_priors"](
-            cls.df_acoustic, cls.sample_quantiles
-        )
-
-        cls.env["EMOTION_PRIORS"].clear()
-        cls.env["EMOTION_PRIORS"].update(cls.emo_priors)
-        cls.env["CLASS_WEIGHTS"].clear()
-        cls.env["CLASS_WEIGHTS"].update(cls.emo_weights)
-        cls.env["ACOUSTIC_CUE_PRIORS"].clear()
-        cls.env["ACOUSTIC_CUE_PRIORS"].update(cls.cue_priors)
-        cls.env["SPEAKER_ACOUSTIC_QUANTILES"].clear()
-        cls.env["SPEAKER_ACOUSTIC_QUANTILES"].update(cls.sample_quantiles)
-
-    @staticmethod
-    def build_completion(
-        pitch_height: str = "moderate",
-        pitch_dynamics: str = "moderate",
-        vocal_energy: str = "moderate",
-        speaking_rate: str = "moderate",
-        voice_quality: str = "modal/normal",
-        emotion: str = "neutral",
-    ) -> str:
-        return (
-            "<think>\n"
-            "[Acoustic Inventory]\n"
-            f"- Pitch Height: {pitch_height}\n"
-            f"- Pitch Dynamics: {pitch_dynamics}\n"
-            f"- Vocal Energy: {vocal_energy}\n"
-            f"- Speaking Rate: {speaking_rate}\n"
-            f"- Voice Quality: {voice_quality}\n\n"
-            "[Prosodic Reasoning]\n"
-            "The speaker exhibits prosodic cues consistent with the acoustic inventory above.\n"
-            "</think>\n"
-            f"<answer>{emotion}</answer>"
-        )
-
-    def test_1_isolated_r1_zero_mean_all_emotions(self) -> None:
-        """Validates R1 in isolation: blind guessing any emotion yields E[R1] == 0.000000."""
-        reward_r1 = self.env["reward_label_accuracy_weighted"]
-        prompts = ["prompt"] * len(self.emotion_samples)
-
-        blind_means = {}
-        for blind_emo in self.VALID_EMOTIONS:
-            completions = [self.build_completion(emotion=blind_emo) for _ in self.emotion_samples]
-            scores = reward_r1(prompts, completions, label=self.emotion_samples)
-            mean_score = float(np.mean(scores))
-            blind_means[blind_emo] = mean_score
-            self.assertAlmostEqual(
-                mean_score,
-                0.0,
-                places=9,
-                msg=f"Blind emotion '{blind_emo}' has non-zero E[R1]={mean_score}",
-            )
-
-        # Spread between highest and lowest blind emotion expectation must be 0.0
-        spread = max(blind_means.values()) - min(blind_means.values())
-        self.assertAlmostEqual(spread, 0.0, places=9)
-
-        # Oracle emotion prediction must yield strictly positive mean reward (> 1.0)
-        oracle_comps = [self.build_completion(emotion=e) for e in self.emotion_samples]
-        oracle_mean = float(np.mean(reward_r1(prompts, oracle_comps, label=self.emotion_samples)))
-        self.assertGreater(oracle_mean, 1.10)
-
-    def test_2_isolated_cues_fix1_ordinal_and_zero_mean(self) -> None:
-        """Validates Fix 1 & Fix 2 per cue in isolation: E[s_c] == 0.0, E[norm_sc] == 0.50, and strict ordinality."""
-        score_cue = self.env["score_cue_zero_mean"]
-        eval_single = self.env["evaluate_single_prompt_acoustics"]
-
-        prompt_options = {
-            "pitch_height": ["low", "moderate", "elevated"],
-            "pitch_dynamics": ["narrow", "moderate", "wide"],
-            "vocal_energy": ["quiet", "moderate", "loud"],
-            "speaking_rate": ["slow", "moderate", "fast"],
-            "voice_quality": ["modal/normal", "pressed/tense", "breathy", "harsh/creaky"],
-        }
-
-        # Check each of the 5 cues in isolation via evaluate_single_prompt_acoustics
-        for cue_name, options in prompt_options.items():
-            for opt in options:
-                raw_scores = []
-                norm_scores = []
-                for row in self.acoustic_samples:
-                    kw = {
-                        "pitch_height": "moderate",
-                        "pitch_dynamics": "moderate",
-                        "vocal_energy": "moderate",
-                        "speaking_rate": "moderate",
-                        "voice_quality": "modal/normal",
-                    }
-                    kw[cue_name] = opt
-                    comp = self.build_completion(**kw)
-                    res = eval_single(
-                        completion=comp,
-                        audio_path=row["audio_path"],
-                        speaker=row["speaker"],
-                        row_data=row,
-                        quantiles_dict=self.sample_quantiles,
-                        audio_lookup={},
-                        priors_dict=self.cue_priors,
-                    )
-                    raw_scores.append(res["cue_raw_scores"][cue_name])
-                    norm_scores.append(res["cue_scores"][cue_name])
-
-                mean_raw = float(np.mean(raw_scores))
-                mean_norm = float(np.mean(norm_scores))
-                self.assertAlmostEqual(
-                    mean_raw,
-                    0.0,
-                    places=9,
-                    msg=f"Cue '{cue_name}' option '{opt}' has non-zero E[s_c]={mean_raw}",
-                )
-                self.assertAlmostEqual(
-                    mean_norm,
-                    0.50,
-                    delta=0.02,
-                    msg=f"Cue '{cue_name}' option '{opt}' has E[norm_sc]={mean_norm} != 0.50",
-                )
-
-        # Verify strict topological ordinality for the 4 continuous quartile cues (Fix 1)
-        for cue_name in self.CUE_FEATURE_MAP:
-            # Ground truth = low: hit(low) > 0 > miss_1step(moderate) > miss_2step(high)
-            s_ll, _, _ = score_cue("low", "low", cue_name, self.cue_priors)
-            s_lm, _, _ = score_cue("low", "moderate", cue_name, self.cue_priors)
-            s_lh, _, _ = score_cue("low", "high", cue_name, self.cue_priors)
-            self.assertGreater(s_ll, 0.0)
-            self.assertLess(s_lm, 0.0)
-            self.assertGreater(
-                s_lm,
-                s_lh,
-                msg=f"Fix 1 ordinality failed on truth=low for {cue_name}: mod={s_lm} <= high={s_lh}",
-            )
-
-            # Ground truth = high: hit(high) > 0 > miss_1step(moderate) > miss_2step(low)
-            s_hh, _, _ = score_cue("high", "high", cue_name, self.cue_priors)
-            s_hm, _, _ = score_cue("high", "moderate", cue_name, self.cue_priors)
-            s_hl, _, _ = score_cue("high", "low", cue_name, self.cue_priors)
-            self.assertGreater(s_hh, 0.0)
-            self.assertLess(s_hm, 0.0)
-            self.assertGreater(
-                s_hm,
-                s_hl,
-                msg=f"Fix 1 ordinality failed on truth=high for {cue_name}: mod={s_hm} <= low={s_hl}",
-            )
-
-            # Ground truth = moderate: hit(moderate) > 0 > miss_1step(low) == miss_1step(high)
-            s_mm, _, _ = score_cue("moderate", "moderate", cue_name, self.cue_priors)
-            s_ml, _, _ = score_cue("moderate", "low", cue_name, self.cue_priors)
-            s_mh, _, _ = score_cue("moderate", "high", cue_name, self.cue_priors)
-            self.assertGreater(s_mm, 0.0)
-            self.assertLess(s_ml, 0.0)
-            self.assertAlmostEqual(s_ml, s_mh, places=9)
-
-    def test_3_isolated_r2_fix2_constant_normalization_equal_probability(self) -> None:
-        """Validates R2 in isolation: every blind acoustic strategy yields E[R2] == 0.500000."""
-        reward_r2 = self.env["reward_acoustic_inventory"]
-        prompts = ["prompt"] * len(self.acoustic_samples)
-        ac_kwargs = {
-            "speaker": [r["speaker"] for r in self.acoustic_samples],
-            **{
-                col: [r[col] for r in self.acoustic_samples]
-                for col in self.ALL_ACOUSTIC_FEATURES.values()
-            },
-        }
-
-        blind_policies = [
-            ("low", "narrow", "quiet", "slow", "modal/normal"),
-            ("moderate", "moderate", "moderate", "moderate", "modal/normal"),
-            ("elevated", "wide", "loud", "fast", "modal/normal"),
-            ("low", "narrow", "quiet", "slow", "pressed/tense"),
-            ("moderate", "moderate", "moderate", "moderate", "breathy"),
-            ("elevated", "wide", "loud", "fast", "harsh/creaky"),
-            ("low", "moderate", "loud", "slow", "breathy"),
-            ("elevated", "narrow", "moderate", "fast", "pressed/tense"),
-        ]
-
-        for pol in blind_policies:
-            comps = [self.build_completion(*pol, emotion="neutral") for _ in self.acoustic_samples]
-            r2_scores = reward_r2(prompts, comps, **ac_kwargs)
-            mean_r2 = float(np.mean(r2_scores))
-            self.assertAlmostEqual(
-                mean_r2,
-                0.50,
-                places=9,
-                msg=f"Blind acoustic policy {pol} has E[R2]={mean_r2} != 0.50",
-            )
-
-    def test_4_isolated_r3_format_reward(self) -> None:
-        """Validates R3 format reward in isolation."""
-        reward_r3 = self.env["reward_format"]
-        valid_comp = self.build_completion()
-        malformed_comp = "The speaker sounds angry."
-
-        scores = reward_r3(["p1", "p2"], [valid_comp, malformed_comp])
-        self.assertAlmostEqual(scores[0], 1.0, places=6)
-        self.assertAlmostEqual(scores[1], 0.0, places=6)
-
-    def test_5_combined_r_unified_fix3_no_class_benefit_on_blind_guess(self) -> None:
-        """Validates combined R_unified: every blind (emotion, acoustic) pair yields E[R_unified] == 0.700000."""
-        unified_reward = self.env["unified_gated_grpo_reward"]
-
-        # Construct full sample product grid (20 emotion samples x 20 acoustic samples = 400 samples)
-        grid_labels: List[str] = []
-        grid_kwargs: Dict[str, List[Any]] = {"speaker": []}
-        for col in self.ALL_ACOUSTIC_FEATURES.values():
-            grid_kwargs[col] = []
-
-        for emo_t in self.emotion_samples:
-            for ac_row in self.acoustic_samples:
-                grid_labels.append(emo_t)
-                grid_kwargs["speaker"].append(ac_row["speaker"])
-                for col in self.ALL_ACOUSTIC_FEATURES.values():
-                    grid_kwargs[col].append(ac_row[col])
-
-        grid_prompts = ["prompt"] * len(grid_labels)
-
-        blind_acoustic_strategies = [
-            ("low", "narrow", "quiet", "slow", "modal/normal"),
-            ("moderate", "moderate", "moderate", "moderate", "modal/normal"),
-            ("elevated", "wide", "loud", "fast", "modal/normal"),
-            ("low", "narrow", "quiet", "slow", "pressed/tense"),
-            ("moderate", "moderate", "moderate", "moderate", "breathy"),
-            ("elevated", "wide", "loud", "fast", "harsh/creaky"),
-            ("low", "moderate", "loud", "fast", "harsh/creaky"),
-        ]
-
-        all_expected_values = []
-        for blind_emo in self.VALID_EMOTIONS:
-            for ac_pol in blind_acoustic_strategies:
-                comps = [
-                    self.build_completion(*ac_pol, emotion=blind_emo)
-                    for _ in grid_labels
-                ]
-                scores = unified_reward(grid_prompts, comps, label=grid_labels, **grid_kwargs)
-                mean_u = float(np.mean(scores))
-                all_expected_values.append(mean_u)
-                self.assertAlmostEqual(
-                    mean_u,
-                    0.70,
-                    places=9,
-                    msg=f"Blind policy (emotion={blind_emo}, acoustics={ac_pol}) gave E[R_unified]={mean_u} != 0.70",
-                )
-
-        # Max spread across all 7 x 7 = 49 blind (emotion, acoustic) combinations must be 0.0
-        spread = max(all_expected_values) - min(all_expected_values)
-        self.assertAlmostEqual(spread, 0.0, places=9)
-
-    def test_6_r_unified_causal_monotonicity_and_ordinal_ranking(self) -> None:
-        """Validates that R_unified strictly rewards better acoustics on both right and wrong emotions."""
-        unified_reward = self.env["unified_gated_grpo_reward"]
-
-        # Sample where ground truth is: emotion='anger', all 4 continuous cues='low', voice_quality='harsh/creaky'
-        sample_kw = {
-            "label": ["anger"],
-            "speaker": ["SampleSpeaker"],
-            self.CUE_FEATURE_MAP["pitch_height"]: [self.cont_values["pitch_height"]["low"]],
-            self.CUE_FEATURE_MAP["pitch_dynamics"]: [self.cont_values["pitch_dynamics"]["low"]],
-            self.CUE_FEATURE_MAP["vocal_energy"]: [self.cont_values["vocal_energy"]["low"]],
-            self.CUE_FEATURE_MAP["speaking_rate"]: [self.cont_values["speaking_rate"]["low"]],
-            self.VOICE_QUALITY_FEATURE_MAP["jitter"]: [self.vq_values["harsh/creaky"]["jitter"]],
-            self.VOICE_QUALITY_FEATURE_MAP["shimmer"]: [self.vq_values["harsh/creaky"]["shimmer"]],
-            self.VOICE_QUALITY_FEATURE_MAP["hnr"]: [self.vq_values["harsh/creaky"]["hnr"]],
-            self.VOICE_QUALITY_FEATURE_MAP["hammarberg"]: [self.vq_values["harsh/creaky"]["hammarberg"]],
-        }
-
-        # Case A: Correct emotion ('anger') with 0-step (Oracle) vs 1-step (Moderate) vs 2-step (High) acoustics
-        c_hit_0step = self.build_completion("low", "narrow", "quiet", "slow", "harsh/creaky", "anger")
-        c_hit_1step = self.build_completion("moderate", "moderate", "moderate", "moderate", "harsh/creaky", "anger")
-        c_hit_2step = self.build_completion("elevated", "wide", "loud", "fast", "harsh/creaky", "anger")
-
-        u_hit_0 = unified_reward(["p"], [c_hit_0step], **sample_kw)[0]
-        u_hit_1 = unified_reward(["p"], [c_hit_1step], **sample_kw)[0]
-        u_hit_2 = unified_reward(["p"], [c_hit_2step], **sample_kw)[0]
-        self.assertGreater(u_hit_0, u_hit_1)
-        self.assertGreater(u_hit_1, u_hit_2)
-
-        # Case B: Wrong emotion ('neutral') with 0-step vs 1-step vs 2-step acoustics
-        # Must NEVER punish good acoustics when the emotion is wrong!
-        c_miss_0step = self.build_completion("low", "narrow", "quiet", "slow", "harsh/creaky", "neutral")
-        c_miss_1step = self.build_completion("moderate", "moderate", "moderate", "moderate", "harsh/creaky", "neutral")
-        c_miss_2step = self.build_completion("elevated", "wide", "loud", "fast", "harsh/creaky", "neutral")
-
-        u_miss_0 = unified_reward(["p"], [c_miss_0step], **sample_kw)[0]
-        u_miss_1 = unified_reward(["p"], [c_miss_1step], **sample_kw)[0]
-        u_miss_2 = unified_reward(["p"], [c_miss_2step], **sample_kw)[0]
-        self.assertGreater(u_miss_0, u_miss_1)
-        self.assertGreater(u_miss_1, u_miss_2)
-
-    def test_7_notebook_validation_cell_68_executes_cleanly(self) -> None:
-        """Executes Cell 68 (validate_grpo_reward_mathematics) from ser_grpo_v2.ipynb directly."""
-        nb_path = Path(__file__).resolve().parent.parent / "ser_grpo_v2.ipynb"
-        with open(nb_path, "r", encoding="utf-8") as f:
-            nb = json.load(f)
-        cell_68_src = "".join(nb["cells"][68]["source"])
-        exec(compile(cell_68_src, "<ser_grpo_v2_cell_68>", "exec"), self.env)
-        report = self.env["validation_math_report"]
-        for emo, val in report["r1_blind_means"].items():
-            self.assertAlmostEqual(val, 0.0, places=9)
-        for pol, val in report["r2_blind_means"].items():
-            self.assertAlmostEqual(val, 0.50, places=9)
-        u_mat_vals = report["r_unified_matrix"].values.flatten()
-        for val in u_mat_vals:
-            self.assertAlmostEqual(float(val), 0.70, places=6)
-
-    def test_8_posterior_map_consistency_and_slope_parity_anti_moderate_collapse(self) -> None:
-        """Validates that Fix 1 has 1:1 marginal slope parity and prevents moderate collapse under posterior beliefs."""
-        get_mat = self.env["get_ordinal_cue_payoff_matrix"]
-        quartile_priors = {"low": 0.25, "moderate": 0.50, "high": 0.25}
-        mat = get_mat(quartile_priors)
-
-        # Extract matrix parameters: e = S[mod][mod], b = -S[mod][low], c = -S[high][low]
-        e_hit = mat["moderate"]["moderate"]
-        b_adj = -mat["moderate"]["low"]
-        c_opp = -mat["high"]["low"]
-
-        # 1. Check penalty on extreme guessing when truth is moderate: b_adj >= 0.20
-        self.assertGreaterEqual(
-            b_adj,
-            0.20,
-            msg=f"Extreme overshoot penalty too weak: b={b_adj:.4f} < 0.20",
-        )
-
-        # 2. Under a moderate-dominant posterior P = (0.28 low, 0.58 mod, 0.14 high),
-        # predicting 'moderate' MUST strictly beat gambling on 'low' or 'high'
-        posterior = {"low": 0.28, "moderate": 0.58, "high": 0.14}
-        exp_scores = {
-            pred: sum(posterior[truth] * mat[truth][pred] for truth in ("low", "moderate", "high"))
-            for pred in ("low", "moderate", "high")
-        }
-        self.assertGreater(
-            exp_scores["moderate"],
-            exp_scores["low"],
-            msg=f"Moderate collapsed under posterior {posterior}: E[mod]={exp_scores['moderate']} <= E[low]={exp_scores['low']}",
-        )
-        self.assertGreater(exp_scores["low"], exp_scores["high"])
-
-        # 3. Regression check: prove that this test catches the old distorted matrix (e=0.40, b=0.20, c=0.55)
-        old_mat = {
-            "low": {"low": 0.95, "moderate": -0.40, "high": -0.55},
-            "moderate": {"low": -0.20, "moderate": 0.40, "high": -0.20},
-            "high": {"low": -0.55, "moderate": -0.40, "high": 0.95},
-        }
-        old_exp_mod = sum(posterior[t] * old_mat[t]["moderate"] for t in ("low", "moderate", "high"))
-        old_exp_low = sum(posterior[t] * old_mat[t]["low"] for t in ("low", "moderate", "high"))
-        self.assertLess(
-            old_exp_mod,
-            old_exp_low,
-            msg="Regression check failed: old matrix should fail posterior MAP consistency",
-        )
-
-    def test_9_unshrunk_r1_penalty_and_emotion_gradient_dominance(self) -> None:
-        """Validates that Fix 3 preserves 100% of R1 emotion miss penalties and R1 hit scale at R2=0.50."""
-        unified_reward = self.env["unified_gated_grpo_reward"]
-        reward_r1 = self.env["reward_label_accuracy_weighted"]
-        reward_r2 = self.env["reward_acoustic_inventory"]
-        reward_r3 = self.env["reward_format"]
-
-        sample_kw = {
-            "label": ["anger"],
-            "speaker": ["SampleSpeaker"],
-            self.CUE_FEATURE_MAP["pitch_height"]: [self.cont_values["pitch_height"]["low"]],
-            self.CUE_FEATURE_MAP["pitch_dynamics"]: [self.cont_values["pitch_dynamics"]["low"]],
-            self.CUE_FEATURE_MAP["vocal_energy"]: [self.cont_values["vocal_energy"]["low"]],
-            self.CUE_FEATURE_MAP["speaking_rate"]: [self.cont_values["speaking_rate"]["low"]],
-            self.VOICE_QUALITY_FEATURE_MAP["jitter"]: [self.vq_values["harsh/creaky"]["jitter"]],
-            self.VOICE_QUALITY_FEATURE_MAP["shimmer"]: [self.vq_values["harsh/creaky"]["shimmer"]],
-            self.VOICE_QUALITY_FEATURE_MAP["hnr"]: [self.vq_values["harsh/creaky"]["hnr"]],
-            self.VOICE_QUALITY_FEATURE_MAP["hammarberg"]: [self.vq_values["harsh/creaky"]["hammarberg"]],
-        }
-
-        # 1. For every wrong emotion prediction (R1 < 0), R_unified must apply 100% of w_r1 * R1 (not 0.575 * R1)
-        for wrong_emo in self.VALID_EMOTIONS:
-            if wrong_emo == "anger":
-                continue
-            comp_miss = self.build_completion("low", "narrow", "quiet", "slow", "harsh/creaky", wrong_emo)
-            r1_val = reward_r1(["p"], [comp_miss], label=["anger"])[0]
-            r2_val = reward_r2(["p"], [comp_miss], **sample_kw)[0]
-            r3_val = reward_r3(["p"], [comp_miss])[0]
-            u_val = unified_reward(["p"], [comp_miss], **sample_kw)[0]
-
-            expected_unshrunk = 1.0 * r1_val + 1.0 * r2_val + 0.2 * r3_val
-            self.assertAlmostEqual(
-                u_val,
-                expected_unshrunk,
-                places=9,
-                msg=f"R1 miss penalty for '{wrong_emo}' was not linear! Got {u_val}, expected {expected_unshrunk}",
-            )
-
-        # 2. Emotion hit vs miss must dominate single-cue acoustic gambles in R_unified
-        comp_emo_hit_mod_ac = self.build_completion(
-            "moderate", "moderate", "moderate", "moderate", "modal/normal", "anger"
-        )
-        comp_emo_miss_oracle_ac = self.build_completion(
-            "low", "narrow", "quiet", "slow", "harsh/creaky", "neutral"
-        )
-        u_emo_hit = unified_reward(["p"], [comp_emo_hit_mod_ac], **sample_kw)[0]
-        u_emo_miss = unified_reward(["p"], [comp_emo_miss_oracle_ac], **sample_kw)[0]
-        self.assertGreater(
-            u_emo_hit,
-            u_emo_miss,
-            msg=f"Acoustic gamble overrode emotion accuracy: u_emo_hit={u_emo_hit} <= u_emo_miss={u_emo_miss}",
-        )
-
-    def test_10_voice_quality_preserves_balanced_sft_decision(self) -> None:
-        """Fix 1B: a balanced-SFT model emits L_k (uniform-prior likelihood). On grpo_train_set the true
-        posterior is P_real ∝ f_k L_k. GRPO must keep argmax_k L_k for EVERY L (no prior re-injection),
-        while keeping E[s_vq | blind guess] == 0 and all scores inside [-1, +1]."""
-        score_cue = self.env["score_cue_zero_mean"]
-        for priors in (
-            {"modal/normal": 0.4225, "breathy": 0.2197, "harsh/creaky": 0.2064, "pressed/tense": 0.1515},
-            {"modal/normal": 0.60, "breathy": 0.15, "harsh/creaky": 0.10, "pressed/tense": 0.15},
-        ):
-            pri = {"voice_quality": priors}
-            classes = list(priors)
-            f = np.array([priors[k] for k in classes])
-            S = np.array([[score_cue(t, p, "voice_quality", pri)[0] for p in classes] for t in classes])
-
-            np.testing.assert_allclose(f @ S, 0.0, atol=1e-12)          # blind guess
-            self.assertLessEqual(S.max(), 1.75)                         # bounded payoff matrix
-            self.assertGreaterEqual(S.min(), -1.0)
-
-            rng = np.random.default_rng(0)
-            L = rng.dirichlet([2.0] * 4, size=50_000)
-            P = f * L
-            P /= P.sum(axis=1, keepdims=True)
-            agreement = float(((P @ S).argmax(1) == L.argmax(1)).mean())
-            self.assertGreaterEqual(agreement, 0.90, msg=f"GRPO overrides balanced SFT on VQ ({agreement:.4%}) for {priors}")
-
-        # Regression: the reverted gamma=0.55 rule and the original rule both fail this property
-        f = np.array([0.4225, 0.2197, 0.2064, 0.1515])
-        L = np.random.default_rng(1).dirichlet([2.0] * 4, size=50_000)
-        P = f * L
-        P /= P.sum(axis=1, keepdims=True)
-        for gamma in (0.0, 0.55):
-            m = (f / 0.25) ** gamma
-            S_old = -np.tile(m * f, (4, 1))
-            S_old[np.arange(4), np.arange(4)] = m * (1 - f)
-            self.assertLess(float(((P @ S_old).argmax(1) == L.argmax(1)).mean()), 0.95)
-
-    def test_11_r_unified_emotion_invariance_at_high_sft_r2(self) -> None:
-        """Validates Fix 3 post-SFT: when the model has high acoustic accuracy (R2 > 0.50), no emotion is favored."""
-        unified_reward = self.env["unified_gated_grpo_reward"]
-
-        tier_to_prompt_opt = {
-            "pitch_height": {"low": "low", "moderate": "moderate", "high": "elevated"},
-            "pitch_dynamics": {"low": "narrow", "moderate": "moderate", "high": "wide"},
-            "vocal_energy": {"low": "quiet", "moderate": "moderate", "high": "loud"},
-            "speaking_rate": {"low": "slow", "moderate": "moderate", "high": "fast"},
-        }
-
-        grid_labels: List[str] = []
-        grid_kwargs: Dict[str, List[Any]] = {"speaker": []}
-        for col in self.ALL_ACOUSTIC_FEATURES.values():
-            grid_kwargs[col] = []
-
-        for emo_t in self.emotion_samples:
-            for ac_row in self.acoustic_samples:
-                grid_labels.append(emo_t)
-                grid_kwargs["speaker"].append(ac_row["speaker"])
-                for col in self.ALL_ACOUSTIC_FEATURES.values():
-                    grid_kwargs[col].append(ac_row[col])
-
-        grid_prompts = ["prompt"] * len(grid_labels)
-
-        # Evaluate expected R_unified for each emotion when acoustics are Oracle (R2 > 0.85, simulating SFT model)
-        sft_emo_means = {}
-        for blind_emo in self.VALID_EMOTIONS:
-            oracle_ac_comps = []
-            for _emo_t in self.emotion_samples:
-                for ac_row in self.acoustic_samples:
-                    t_c = ac_row["truth_tier"]
-                    t_vq = ac_row["truth_vq"]
-                    oracle_ac_comps.append(
-                        self.build_completion(
-                            tier_to_prompt_opt["pitch_height"][t_c],
-                            tier_to_prompt_opt["pitch_dynamics"][t_c],
-                            tier_to_prompt_opt["vocal_energy"][t_c],
-                            tier_to_prompt_opt["speaking_rate"][t_c],
-                            t_vq,
-                            emotion=blind_emo,
-                        )
-                    )
-            scores = unified_reward(grid_prompts, oracle_ac_comps, label=grid_labels, **grid_kwargs)
-            sft_emo_means[blind_emo] = float(np.mean(scores))
-
-        spread = max(sft_emo_means.values()) - min(sft_emo_means.values())
-        self.assertAlmostEqual(
-            spread,
-            0.0,
-            places=9,
-            msg=f"Post-SFT emotion bias when R2 > 0.50! Spread={spread}, means={sft_emo_means}",
-        )
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+import pytest
+from tests.notebook_helpers import load_reward_environment
+
+
+def load_notebook_reward_env():
+    return load_reward_environment()
+
+
+@pytest.fixture
+def env():
+    return load_reward_environment()
+
+
+def calibration_data(env):
+    raw = pd.DataFrame([
+        {**{col: float(offset + i) for col in env["ALL_ACOUSTIC_FEATURES"].values()},
+         "speaker": spk, "audio_path": f"raw_{spk}_{i}.wav"}
+        for spk, offset in (("A", 0), ("B", 100)) for i in range(1, 101)
+    ])
+    tier_sequences = [[10.] * 4 + [50.] * 9 + [90.] * 7,
+                      [10.] * 8 + [50.] * 5 + [90.] * 7,
+                      [10.] * 3 + [50.] * 11 + [90.] * 6,
+                      [10.] * 7 + [50.] * 9 + [90.] * 4]
+    voice_labels = ["modal/normal"] * 8 + ["pressed/tense"] * 3 + ["breathy"] * 5 + ["harsh/creaky"] * 4
+    voices = {"modal/normal": (50., 50., 50., 50.), "pressed/tense": (50., 50., 50., 10.),
+              "breathy": (50., 50., 50., 90.), "harsh/creaky": (90., 90., 10., 50.)}
+    emotions = [e for e, count in {"neutral": 7, "joy": 4, "anger": 3, "fear": 2,
+                                  "sadness": 2, "disgust": 1, "surprise": 1}.items() for _ in range(count)]
+    rows = []
+    for i, emotion in enumerate(emotions):
+        offset = 100 if i % 2 else 0
+        row = {"speaker": "B" if offset else "A", "audio_path": f"grpo_{i}.wav", "emotion": emotion}
+        row.update({col: seq[i] + offset for col, seq in zip(env["CUE_FEATURE_MAP"].values(), tier_sequences)})
+        row.update({col: value + offset for col, value in zip(env["VOICE_QUALITY_FEATURE_MAP"].values(), voices[voice_labels[i]])})
+        rows.append(row)
+    held_out = raw.iloc[:80].copy()
+    held_out["audio_path"] = [f"val_{i}.wav" for i in range(len(held_out))]
+    held_out[list(env["ALL_ACOUSTIC_FEATURES"].values())] = 1e6
+    return pd.concat([raw, held_out], ignore_index=True), pd.DataFrame(rows), held_out
+
+
+def install_calibration(env, grpo, cal):
+    env["SPEAKER_ACOUSTIC_QUANTILES"] = cal["quantiles"]
+    env["ACOUSTIC_CUE_PRIORS"] = cal["priors"]
+    env["ACOUSTIC_CUE_PAYOFFS"] = cal["payoffs"]
+    env["EMOTION_PRIORS"], env["EMOTION_PAYOFFS"] = env["calibrate_emotion_payoffs"](grpo)
+    return {"speaker": grpo.speaker.tolist(), "label": grpo.emotion.tolist(),
+            **{col: grpo[col].tolist() for col in env["ALL_ACOUSTIC_FEATURES"].values()}}
+
+
+@pytest.fixture
+def calibrated(env):
+    raw, grpo, val = calibration_data(env)
+    cal = env["calibrate_acoustic_payoffs"](grpo, raw, val)
+    return env, raw, grpo, val, cal, install_calibration(env, grpo, cal)
+
+
+@pytest.mark.parametrize("categories", [3, 4, 7])
+def test_blind_actions_zero_for_many_empirical_distributions(env, categories):
+    rng = np.random.default_rng(42)
+    for _ in range(100):
+        counts = rng.integers(1, 1000, size=categories)
+        probabilities = counts / counts.sum()
+        payoffs = env["compute_zero_mean_hit_miss"](dict(zip(map(str, range(categories)), counts)))
+        assert len({p["miss"] for p in payoffs.values()}) == 1
+        for i, p in enumerate(payoffs.values()):
+            scores = np.full(categories, p["miss"])
+            scores[i] = p["hit"]
+            assert probabilities @ scores == pytest.approx(0., abs=1e-12)
+            assert 0 < p["hit"] <= 1 + 1e-12
+            assert -1 <= p["miss"] < 0
+
+
+@pytest.mark.parametrize("priors", [dict(a=0, b=1), dict(a=-1, b=2), dict(a=np.nan, b=1),
+                                    dict(a=np.inf, b=1), {}, dict(a=1)])
+def test_unobserved_or_invalid_categories_are_rejected(env, priors):
+    with pytest.raises(ValueError):
+        env["compute_zero_mean_hit_miss"](priors)
+
+
+def test_raw_quartiles_and_grpo_frequencies_are_separate(calibrated):
+    env, raw, grpo, val, cal, _ = calibrated
+    original_raw, original_grpo = raw.copy(deep=True), grpo.copy(deep=True)
+    again = env["calibrate_acoustic_payoffs"](grpo, raw, val)
+    pd.testing.assert_frame_equal(raw, original_raw)
+    pd.testing.assert_frame_equal(grpo, original_grpo)
+    assert again["reference_rows"] == 200
+    assert cal["quantiles"]["A"]["pitch_height"] == {"q25": 25.75, "q75": 75.25}
+    assert cal["quantiles"]["B"]["pitch_height"] == {"q25": 125.75, "q75": 175.25}
+    assert cal["priors"]["pitch_height"] == {"low": .2, "moderate": .45, "high": .35}
+    assert cal["priors"]["pitch_dynamics"] == {"low": .4, "moderate": .25, "high": .35}
+    assert cal["counts"]["voice_quality"] == {"modal/normal": 8, "pressed/tense": 3, "breathy": 5, "harsh/creaky": 4}
+    np.testing.assert_allclose(cal["summary"]["E[blind]"], 0, atol=1e-12)
+    changed = env["calibrate_acoustic_payoffs"](pd.concat([grpo, grpo.iloc[:3]]), raw, val)
+    assert changed["quantiles"] == cal["quantiles"]
+    assert changed["payoffs"]["pitch_height"] != cal["payoffs"]["pitch_height"]
+
+
+def test_validation_overlap_and_absent_categories_fail(calibrated):
+    env, raw, grpo, val, _, _ = calibrated
+    overlap = grpo.copy()
+    overlap.loc[0, "audio_path"] = val.audio_path.iloc[0]
+    with pytest.raises(ValueError, match="overlaps validation"):
+        env["calibrate_acoustic_payoffs"](overlap, raw, val)
+    with pytest.raises(ValueError, match="audio_path"):
+        env["calibrate_acoustic_payoffs"](grpo, raw, val.drop(columns="audio_path"))
+    with pytest.raises(ValueError, match="unobserved"):
+        env["calibrate_emotion_payoffs"](grpo[grpo.emotion != "fear"])
+    no_high = grpo.copy()
+    no_high[env["CUE_FEATURE_MAP"]["pitch_height"]] = 50.
+    with pytest.raises(ValueError, match="pitch_height"):
+        env["calibrate_acoustic_payoffs"](no_high, raw, val)
+
+
+def test_notebook_initialization_uses_actual_datasets(calibrated):
+    from tests.notebook_helpers import cell_source
+    env, raw, grpo, val, cal, _ = calibrated
+    env.update(raw_train_set=raw, grpo_train_set=grpo, val_set=val)
+    exec(cell_source("def calibrate_emotion_payoffs("), env)
+    exec(cell_source("def reward_acoustic_inventory("), env)
+    assert env["ACOUSTIC_CUE_PRIORS"] == cal["priors"]
+    assert env["SPEAKER_ACOUSTIC_QUANTILES"] == cal["quantiles"]
+    assert env["EMOTION_PRIORS"]["neutral"] == .35
+
+
+def test_r1_every_emotion_zero_mean_and_valid_misses_equal(calibrated):
+    env, _, grpo, _, _, kwargs = calibrated
+    reward, build = env["reward_label_accuracy_weighted"], env["build_sample_completion"]
+    for emotion in sorted(env["VALID_EMOTIONS"]):
+        scores = reward(["p"] * len(grpo), [build(emotion=emotion)] * len(grpo), **kwargs)
+        assert np.mean(scores) == pytest.approx(0., abs=1e-12)
+        assert all((s > 0) == (t == emotion) for s, t in zip(scores, grpo.emotion))
+    wrong = [e for e in env["VALID_EMOTIONS"] if e != "joy"]
+    scores = reward(["p"] * len(wrong), [build(emotion=e) for e in wrong], label=["joy"] * len(wrong))
+    np.testing.assert_allclose(scores, scores[0])
+    assert reward(["p"], [build(emotion="invalid")], label=["joy"])[0] <= min(scores)
+
+
+def test_uncalibrated_scoring_fails(env):
+    with pytest.raises(ValueError, match="calibrate_emotion_payoffs"):
+        env["reward_label_accuracy_weighted"](["p"], [env["build_sample_completion"]()], label=["joy"])
+    with pytest.raises(ValueError, match="calibration"):
+        env["score_cue_zero_mean"]("low", "low", "pitch_height")
+    with pytest.raises(ValueError, match="calibration"):
+        env["reward_acoustic_inventory"](["p"], [env["build_sample_completion"]()])
+
+
+def test_all_324_constant_inventories_have_equal_r2(calibrated):
+    env, _, grpo, _, _, kwargs = calibrated
+    options = [("low", "moderate", "elevated"), ("narrow", "moderate", "wide"),
+               ("quiet", "moderate", "loud"), ("slow", "moderate", "fast"),
+               ("modal/normal", "pressed/tense", "breathy", "harsh/creaky")]
+    for inventory in product(*options):
+        text = env["build_sample_completion"](*inventory)
+        scores = env["reward_acoustic_inventory"](["p"] * len(grpo), [text] * len(grpo), **kwargs)
+        assert np.mean(scores) == pytest.approx(.5, abs=1e-12), inventory
+        assert all(0 <= score <= 1 for score in scores)
+
+
+def test_hits_beat_all_misses_and_omission_never_helps(calibrated):
+    env, _, _, _, cal, _ = calibrated
+    for cue, priors in cal["priors"].items():
+        for truth in priors:
+            hit, _, exact = env["score_cue_zero_mean"](truth, truth, cue)
+            assert exact == 1
+            misses = [env["score_cue_zero_mean"](truth, p, cue)[0] for p in priors if p != truth]
+            assert hit > max(misses)
+            assert max(misses) == pytest.approx(min(misses))
+            assert env["score_cue_zero_mean"](truth, None, cue)[0] <= min(misses)
+            assert env["score_cue_zero_mean"](truth, "unknown", cue)[0] <= min(misses)
+
+
+def test_missing_gt_preserves_baseline_and_train_eval_agreement(calibrated):
+    env, raw, grpo, val, _, _ = calibrated
+    incomplete = grpo.copy()
+    incomplete.loc[0, env["CUE_FEATURE_MAP"]["pitch_height"]] = np.nan
+    incomplete.loc[1, env["CUE_FEATURE_MAP"]["pitch_dynamics"]] = 0.
+    incomplete.loc[2, env["VOICE_QUALITY_FEATURE_MAP"]["jitter"]] = np.inf
+    incomplete.loc[3, list(env["ALL_ACOUSTIC_FEATURES"].values())] = np.nan
+    cal = env["calibrate_acoustic_payoffs"](incomplete, raw, val)
+    kwargs = install_calibration(env, incomplete, cal)
+    for inventory in [("low", "narrow", "quiet", "slow", "modal/normal"),
+                      ("moderate", "moderate", "moderate", "moderate", "breathy"),
+                      ("elevated", "wide", "loud", "fast", "harsh/creaky")]:
+        text = env["build_sample_completion"](*inventory)
+        scores = env["reward_acoustic_inventory"](["p"] * len(grpo), [text] * len(grpo), **kwargs)
+        assert np.mean(scores) == pytest.approx(.5, abs=1e-12)
+        for score, (_, row) in zip(scores, incomplete.iterrows()):
+            diagnostic = env["evaluate_single_prompt_acoustics"](text, row.audio_path, row.speaker, row_data=row.to_dict())
+            assert diagnostic["r2_acoustic_reward"] == pytest.approx(score)
+        assert scores[3] == .5
+
+
+def test_balanced_decision_rule_and_rare_class_bounds(env):
+    f = np.array([.6, .15, .15, .1])
+    cats = ("modal/normal", "pressed/tense", "breathy", "harsh/creaky")
+    payoff = env["get_voice_quality_payoff_matrix"](dict(zip(cats, f)))
+    matrix = np.array([[payoff[t][p] for p in cats] for t in cats])
+    likelihood = np.random.default_rng(3).dirichlet([2.] * 4, size=1000)
+    posterior = f * likelihood
+    posterior /= posterior.sum(axis=1, keepdims=True)
+    np.testing.assert_array_equal((posterior @ matrix).argmax(axis=1), likelihood.argmax(axis=1))
+    rare = env["compute_zero_mean_hit_miss"](dict(low=1e-9, moderate=.7, high=.3 - 1e-9))
+    assert max(x["hit"] for x in rare.values()) == pytest.approx(1.)
+
+
+def test_composite_trace_and_internal_validation_preserve_live_calibration(calibrated):
+    env, _, grpo, _, cal, kwargs = calibrated
+    text, trace = env["build_sample_completion"](), []
+    scores = env["unified_gated_grpo_reward"](["p"] * len(grpo), [text] * len(grpo), _reward_trace_sink=trace, **kwargs)
+    assert len(trace) == len(grpo)
+    for score, components in zip(scores, trace):
+        assert score == pytest.approx(sum(env["REWARD_WEIGHTS"][k] * components[k] for k in ("r1", "r2", "r3")))
+        assert components["r3"] == 1.
+    prior_snapshot = {k: dict(p) for k, p in env["ACOUSTIC_CUE_PRIORS"].items()}
+    emotion_snapshot = dict(env["EMOTION_PRIORS"])
+    report = env["validate_grpo_reward_mathematics"]()
+    expected = .5 * env["REWARD_WEIGHTS"]["r2"] + env["REWARD_WEIGHTS"]["r3"]
+    np.testing.assert_allclose(report["r_unified_matrix"].values, expected, atol=1e-12)
+    assert env["ACOUSTIC_CUE_PRIORS"] == prior_snapshot == cal["priors"]
+    assert env["EMOTION_PRIORS"] == emotion_snapshot

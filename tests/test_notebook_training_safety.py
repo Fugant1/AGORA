@@ -8,10 +8,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from tests.notebook_helpers import cell_source, load_reward_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 NB = json.loads((ROOT / 'ser_grpo_v2.ipynb').read_text())
-SOURCE = ''.join(NB['cells'][78]['source'])
+SOURCE = cell_source('class AudioGRPOTrainer(')
 
 
 class Array(np.ndarray):
@@ -102,20 +103,20 @@ def test_evaluation_uses_training_callable_and_no_old_gate():
 
 def test_config_matches_loss_scaling_and_replay_never_generates():
     assert 'loss_is_scaled_for_ga = True' in SOURCE
-    assert 'loss_type="dr_grpo"' in ''.join(NB['cells'][79]['source'])
+    assert 'loss_type="dr_grpo"' in cell_source('training_args = GRPOConfig(')
     for name in ['check_one_replay_update', 'compare_replay_checkpoints']:
         node = next(n for n in ast.parse(SOURCE).body if isinstance(n, ast.FunctionDef) and n.name == name)
         assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'generate'
                        for n in ast.walk(node))
         assert any(isinstance(n, ast.Try) and n.finalbody for n in ast.walk(node))
-    for i in (67, 68, 71, 78, 79, 80, 101):
-        compile(''.join(NB['cells'][i]['source']), f'<cell {i}>', 'exec')
+    for marker in ('def unified_gated_grpo_reward(', 'def validate_grpo_reward_mathematics(',
+                   '# 1. Fetch token IDs', 'class AudioGRPOTrainer(',
+                   'training_args = GRPOConfig(', '# Free CPU checks;', 'def evaluate_grpo_validation('):
+        compile(cell_source(marker), f'<cell:{marker}>', 'exec')
 
 
 def test_current_reward_math_validation_runs_with_current_weights():
-    env = {'display': lambda *args: None}
-    for i in (51, 52, 53, 54, 55, 56, 57, 61, 63, 65, 67, 68):
-        exec(compile(''.join(NB['cells'][i]['source']), f'<cell {i}>', 'exec'), env)
-    report = env['validation_math_report']
+    env = load_reward_environment()
+    report = env['validate_grpo_reward_mathematics']()
     baseline = .5 * env['REWARD_WEIGHTS']['r2'] + env['REWARD_WEIGHTS']['r3']
     np.testing.assert_allclose(report['r_unified_matrix']['All Moderate + Modal'], baseline)

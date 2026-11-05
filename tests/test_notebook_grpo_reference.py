@@ -6,9 +6,10 @@ from pathlib import Path
 import textwrap
 
 import pytest
+from tests.notebook_helpers import cell_source
 
 NB = json.loads((Path(__file__).resolve().parents[1] / 'ser_grpo_v2.ipynb').read_text())
-SOURCE = ''.join(NB['cells'][78]['source'])
+SOURCE = cell_source('class AudioGRPOTrainer(')
 
 
 def reference_context():
@@ -95,7 +96,7 @@ def test_mixed_audio_group_is_rejected():
 
 
 def test_changed_cells_compile_and_frozen_reference_is_wired():
-    for i in (72, 78, 79):
-        compile(''.join(NB['cells'][i]['source']), f'<cell {i}>', 'exec')
-    assert 'reference_adapter_name=SFT_REFERENCE_ADAPTER' in ''.join(NB['cells'][79]['source'])
+    for marker in ('SFT_REFERENCE_ADAPTER =', 'class AudioGRPOTrainer(', 'training_args = GRPOConfig('):
+        compile(cell_source(marker), f'<cell:{marker}>', 'exec')
+    assert 'reference_adapter_name=SFT_REFERENCE_ADAPTER' in cell_source('training_args = GRPOConfig(')
     assert 'with reference_policy(unwrapped_model, self.reference_adapter_name):' in SOURCE
