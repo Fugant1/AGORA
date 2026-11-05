@@ -276,14 +276,133 @@ def test_mutually_exclusive_flags_reject_invalid_combinations(calibrated):
         env["resolve_reward_mode"](True, None)
 
     # Global flag mutation to invalid combination must also fail immediately
-    env["USE_ZERO_MEAN"] = True
-    env["USE_MAP"] = True
+    for bad_zm, bad_map, bad_if in [
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+        (False, False, False),
+    ]:
+        env["USE_ZERO_MEAN"] = bad_zm
+        env["USE_MAP"] = bad_map
+        env["USE_INVERSE_FREQUENCY"] = bad_if
+        try:
+            with pytest.raises(ValueError, match="(?i)mutually exclusive|exactly one"):
+                env["compute_hit_miss"](dict(a=1, b=2))
+            with pytest.raises(ValueError, match="(?i)mutually exclusive|exactly one"):
+                env["resolve_reward_mode"](bad_zm, bad_map, bad_if)
+        finally:
+            env["USE_ZERO_MEAN"] = True
+            env["USE_MAP"] = False
+            env["USE_INVERSE_FREQUENCY"] = False
+
+
+def test_inverse_frequency_mode_r1_r2_formula_bounds_and_train_eval_agreement(calibrated):
+    from tests.notebook_helpers import cell_source
+
+    env, raw, grpo, val, _, kwargs = calibrated
+    # Cell 53 guard accepts single-True USE_INVERSE_FREQUENCY and rejects multi-True
+    cell53 = cell_source("VALID_EMOTIONS =  {")
+    ns_bad = {}
+    with pytest.raises(ValueError, match="(?i)mutually exclusive|exactly one"):
+        exec(cell53.replace("USE_INVERSE_FREQUENCY = False", "USE_INVERSE_FREQUENCY = True"), ns_bad)
+
+    env["USE_ZERO_MEAN"] = False
+    env["USE_MAP"] = False
+    env["USE_INVERSE_FREQUENCY"] = True
     try:
-        with pytest.raises(ValueError, match="(?i)mutually exclusive|exactly one"):
-            env["compute_hit_miss"](dict(a=1, b=2))
+        cal_if = env["calibrate_acoustic_payoffs"](grpo, raw, val)
+        assert cal_if["mode"] == "inverse_frequency"
+
+        # 1. R1 inverse frequency: neutral -> 1129/(7*169), other hits -> 1129/(7*160), wrong/invalid -> 0.0
+        r1_fn = env["reward_label_accuracy_weighted"]
+        build = env["build_sample_completion"]
+        r1_scores = r1_fn(
+            ["p"] * 4,
+            [build(emotion="neutral"), build(emotion="anger"), build(emotion="joy"), build(emotion="invalid")],
+            label=["neutral", "anger", "sadness", "joy"],
+        )
+        assert r1_scores[0] == pytest.approx(1129 / (7 * 169), abs=1e-12)
+        assert r1_scores[1] == pytest.approx(1129 / (7 * 160), abs=1e-12)
+        assert r1_scores[2] == 0.0
+        assert r1_scores[3] == 0.0
+
+        # 2. R2 per-cue formula: IF = N_total / (N_classes * count_c) == 1.0 / (N_classes * prior_c) on hit, 0.0 on miss/omission
+        for cue, counts in cal_if["counts"].items():
+            n_total = sum(counts.values())
+            n_classes = len(counts)
+            priors = cal_if["priors"][cue]
+            for truth, count_t in counts.items():
+                expected_if = n_total / (n_classes * count_t)
+                assert expected_if == pytest.approx(1.0 / (n_classes * priors[truth]), abs=1e-12)
+                sc_hit, mx_hit, exact_hit = env["score_cue_payoff"](truth, truth, cue, cal_if["priors"])
+                assert sc_hit == pytest.approx(expected_if, abs=1e-12)
+                assert mx_hit == pytest.approx(expected_if, abs=1e-12)
+                assert exact_hit == 1.0
+                for wrong in counts:
+                    if wrong != truth:
+                        sc_miss, mx_miss, exact_miss = env["score_cue_payoff"](truth, wrong, cue, cal_if["priors"])
+                        assert sc_miss == 0.0
+                        assert mx_miss == pytest.approx(expected_if, abs=1e-12)
+                        assert exact_miss == 0.0
+                assert env["score_cue_payoff"](truth, None, cue, cal_if["priors"])[0] == 0.0
+                assert env["score_cue_payoff"](truth, "unknown_val", cue, cal_if["priors"])[0] == 0.0
+
+        # 3. R2 sample normalization: sum(achieved on right cues) / sum(max possible across scorable cues) in [0, 1]
+        # Row 0 in calibration_data: values (10, 10, 10, 10) -> all low tiers ('low', 'narrow', 'quiet', 'slow') and 'modal/normal'
+        row0 = grpo.iloc[0]
+        row0_kwargs = {
+            "speaker": [row0.speaker],
+            "priors_dict": cal_if["priors"],
+            "quantiles_dict": cal_if["quantiles"],
+            **{col: [row0[col]] for col in env["ALL_ACOUSTIC_FEATURES"].values()},
+        }
+        w_ph = 1.0 / (3 * cal_if["priors"]["pitch_height"]["low"])
+        w_pd = 1.0 / (3 * cal_if["priors"]["pitch_dynamics"]["low"])
+        w_ve = 1.0 / (3 * cal_if["priors"]["vocal_energy"]["low"])
+        w_sr = 1.0 / (3 * cal_if["priors"]["speaking_rate"]["low"])
+        w_vq = 1.0 / (4 * cal_if["priors"]["voice_quality"]["modal/normal"])
+        max_sum = w_ph + w_pd + w_ve + w_sr + w_vq
+
+        all_right = build("low", "narrow", "quiet", "slow", "modal/normal")
+        all_wrong = build("elevated", "wide", "loud", "fast", "harsh/creaky")
+        partial = build("low", "wide", "quiet", "fast", "harsh/creaky")  # pitch_height + vocal_energy right
+
+        assert env["reward_acoustic_inventory"](["p"], [all_right], **row0_kwargs)[0] == pytest.approx(1.0, abs=1e-12)
+        assert env["reward_acoustic_inventory"](["p"], [all_wrong], **row0_kwargs)[0] == pytest.approx(0.0, abs=1e-12)
+        assert env["reward_acoustic_inventory"](["p"], ["<think>empty</think><answer>joy</answer>"], **row0_kwargs)[0] == 0.0
+        expected_partial = (w_ph + w_ve) / max_sum
+        assert 0.0 < expected_partial < 1.0
+        assert env["reward_acoustic_inventory"](["p"], [partial], **row0_kwargs)[0] == pytest.approx(expected_partial, abs=1e-12)
+
+        # 4. Missing GT cues + train/eval parity across full dataset
+        incomplete = grpo.copy()
+        incomplete.loc[0, env["CUE_FEATURE_MAP"]["pitch_height"]] = np.nan
+        incomplete.loc[3, list(env["ALL_ACOUSTIC_FEATURES"].values())] = np.nan
+        inc_kwargs = {
+            "speaker": incomplete.speaker.tolist(),
+            "priors_dict": cal_if["priors"],
+            "quantiles_dict": cal_if["quantiles"],
+            **{col: incomplete[col].tolist() for col in env["ALL_ACOUSTIC_FEATURES"].values()},
+        }
+        batch_scores = env["reward_acoustic_inventory"](["p"] * len(incomplete), [partial] * len(incomplete), **inc_kwargs)
+        assert all(0.0 <= s <= 1.0 for s in batch_scores)
+        assert batch_scores[3] == 0.0
+        for score, (_, row) in zip(batch_scores, incomplete.iterrows()):
+            diag = env["evaluate_single_prompt_acoustics"](
+                partial, row.audio_path, row.speaker, row_data=row.to_dict(),
+                quantiles_dict=cal_if["quantiles"], priors_dict=cal_if["priors"],
+            )
+            assert diag["r2_acoustic_reward"] == pytest.approx(score, abs=1e-12)
+
+        report_if = env["validate_grpo_reward_mathematics"]()
+        assert report_if["mode"] == "inverse_frequency"
+        assert report_if["r1_matrix_proof"]["inverse_frequency_satisfied"] is True
+        assert all(p["inverse_frequency_satisfied"] is True for p in report_if["r2_matrix_proofs"].values())
     finally:
         env["USE_ZERO_MEAN"] = True
         env["USE_MAP"] = False
+        env["USE_INVERSE_FREQUENCY"] = False
 
 
 def test_map_mode_r1_r2_priors_and_train_eval_agreement(calibrated):
