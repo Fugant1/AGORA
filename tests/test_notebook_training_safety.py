@@ -25,8 +25,32 @@ class Array(np.ndarray):
     def long(self):
         return self.astype(np.int64).view(Array)
 
+    def float(self):
+        return self.astype(np.float32).view(Array)
+
     def cumsum(self, dim):
         return np.asarray(self).cumsum(axis=dim).view(Array)
+
+    def mean(self, dim=None, keepdim=False, **kwargs):
+        return np.asarray(self).mean(axis=dim, keepdims=keepdim, **kwargs).view(Array)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def unsqueeze(self, dim):
+        return np.expand_dims(self, axis=dim).view(Array)
+
+    def view(self, *shape):
+        if len(shape) == 1 and isinstance(shape[0], type) and issubclass(shape[0], np.ndarray):
+            return super().view(shape[0])
+        return np.asarray(self).reshape(*shape).view(Array)
+
+    @property
+    def device(self):
+        return None
 
 
 def helper(name, **env):
@@ -120,3 +144,67 @@ def test_current_reward_math_validation_runs_with_current_weights():
     report = env['validate_grpo_reward_mathematics']()
     baseline = .5 * env['REWARD_WEIGHTS']['r2'] + env['REWARD_WEIGHTS']['r3']
     np.testing.assert_allclose(report['r_unified_matrix']['All Moderate + Modal'], baseline)
+
+
+def test_token_span_advantage_splitting_isolates_r2_and_r1_and_shares_r3():
+    torch_ns = SimpleNamespace(
+        bool=bool,
+        float32=np.float32,
+        zeros_like=lambda a, dtype=None: np.zeros_like(a, dtype=dtype or a.dtype).view(Array),
+        zeros=lambda shape, dtype=bool, device=None: np.zeros(shape, dtype=dtype).view(Array),
+        tensor=lambda data, dtype=None, device=None: np.array(data, dtype=dtype).view(Array),
+        nan_to_num=lambda a, nan=0.0: np.nan_to_num(a, nan=nan).view(Array),
+    )
+    env = {
+        'torch': torch_ns,
+        'SPAN2_MARKER_SEQUENCES': (
+            (58, 44915, 52760, 26759),
+            (44915, 52760, 26759),
+            (522, 26865),
+            (27, 9217, 29),
+        ),
+        'REWARD_WEIGHTS': {'r1': 2.0, 'r2': 2.0, 'r3': 0.2},
+    }
+    for fn_name in (
+        'completion_boundary_mask',
+        'completion_span_masks',
+        'compute_span_split_advantages',
+        'build_span_split_token_advantages',
+    ):
+        env[fn_name] = helper(fn_name, **env)
+
+    # All-wrong emotion group (R1 tied, R3=1.0, R2 varies): Span 2 must get 0.0 advantage
+    sample_ids = torch_ns.tensor([
+        [13708, 766, 397, 58, 11654, 58, 44915, 52760, 26759, 287, 921, 59568, 151645, 151645],
+        [13708, 766, 397, 58, 11654, 58, 44915, 52760, 26759, 287, 921, 4243, 151645, 151645],
+    ])
+    sample_mask = env['completion_boundary_mask'](sample_ids, [151645], 151645)
+    all_wrong_trace = [
+        {'r1': -0.1417, 'r2': 0.70, 'r3': 1.0},
+        {'r1': -0.1417, 'r2': 0.30, 'r3': 1.0},
+    ]
+    adv_dict = env['compute_span_split_advantages'](all_wrong_trace, 2)
+    tok_adv, ac_mask, em_mask, has_b = env['build_span_split_token_advantages'](
+        sample_ids, sample_mask, adv_dict['adv_acoustic'], adv_dict['adv_emotion'], adv_dict['adv_total']
+    )
+    assert bool(has_b.all().item())
+    np.testing.assert_array_equal(ac_mask + em_mask, sample_mask)
+    assert int((ac_mask * em_mask).sum().item()) == 0
+    # Span 1 (tokens 0..4) gets +0.40 / -0.40 from R2; Span 2 (tokens 5..12) gets exact 0.0
+    np.testing.assert_allclose(tok_adv[0, :5], 0.40, atol=1e-6)
+    np.testing.assert_allclose(tok_adv[1, :5], -0.40, atol=1e-6)
+    np.testing.assert_allclose(tok_adv[:, 5:13], 0.0, atol=1e-7)
+
+    # When R3 varies, its centered advantage is added to BOTH Span 1 and Span 2
+    r3_trace = [
+        {'r1': -0.1417, 'r2': 0.50, 'r3': 1.0},
+        {'r1': -0.1417, 'r2': 0.50, 'r3': 0.5},
+    ]
+    adv_r3_dict = env['compute_span_split_advantages'](r3_trace, 2)
+    tok_adv_r3, _, _, _ = env['build_span_split_token_advantages'](
+        sample_ids, sample_mask, adv_r3_dict['adv_acoustic'], adv_r3_dict['adv_emotion'], adv_r3_dict['adv_total']
+    )
+    # Rollout 0 gets +0.05 across all active tokens (0..12), Rollout 1 gets -0.05
+    np.testing.assert_allclose(tok_adv_r3[0, :13], 0.05, atol=1e-6)
+    np.testing.assert_allclose(tok_adv_r3[1, :13], -0.05, atol=1e-6)
+    assert float(tok_adv_r3[0, 13].item()) == 0.0
