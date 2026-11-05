@@ -208,3 +208,26 @@ def test_token_span_advantage_splitting_isolates_r2_and_r1_and_shares_r3():
     np.testing.assert_allclose(tok_adv_r3[0, :13], 0.05, atol=1e-6)
     np.testing.assert_allclose(tok_adv_r3[1, :13], -0.05, atol=1e-6)
     assert float(tok_adv_r3[0, 13].item()) == 0.0
+
+    # When use_split_advantage=False, ALL active tokens receive adv_total (R1 + R2 + R3)
+    mixed_trace = [
+        {'r1': 0.85, 'r2': 0.30, 'r3': 1.0},
+        {'r1': -0.15, 'r2': 0.70, 'r3': 0.5},
+    ]
+    adv_mixed = env['compute_span_split_advantages'](mixed_trace, 2)
+    simple_tok_adv, _, _, _ = env['build_span_split_token_advantages'](
+        sample_ids,
+        sample_mask,
+        adv_mixed['adv_acoustic'],
+        adv_mixed['adv_emotion'],
+        adv_mixed['adv_total'],
+        use_split_advantage=False,
+    )
+    expected_total_0 = float(adv_mixed['adv_total'][0])
+    expected_total_1 = float(adv_mixed['adv_total'][1])
+    np.testing.assert_allclose(simple_tok_adv[0, :13], expected_total_0, atol=1e-6)
+    np.testing.assert_allclose(simple_tok_adv[1, :13], expected_total_1, atol=1e-6)
+    assert float(simple_tok_adv[0, 13].item()) == 0.0
+    assert float(simple_tok_adv[1, 13].item()) == 0.0
+    assert 'USE_SPLIT_ADVANTAGE = True' in cell_source('training_args = GRPOConfig(')
+    assert 'use_split_advantage=USE_SPLIT_ADVANTAGE' in cell_source('training_args = GRPOConfig(')

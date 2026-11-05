@@ -69,6 +69,7 @@ def test_blind_actions_zero_for_many_empirical_distributions(env, categories):
     for _ in range(100):
         counts = rng.integers(1, 1000, size=categories)
         probabilities = counts / counts.sum()
+        is_uniform = bool((probabilities.max() - probabilities.min()) <= 1e-12)
         priors_input = dict(zip(map(str, range(categories)), counts))
         payoffs = env["compute_hit_miss"](priors_input)
         assert payoffs == env["compute_zero_mean_hit_miss"](priors_input)
@@ -78,9 +79,8 @@ def test_blind_actions_zero_for_many_empirical_distributions(env, categories):
             assert probabilities @ scores == pytest.approx(0., abs=1e-12)
             assert p["hit"] - p["miss"] == pytest.approx(1., abs=1e-12)
             assert p["delta"] == pytest.approx(1., abs=1e-12)
-            assert p["map_consistent"] is True
-            assert p["e_map_target"] > 0.0
-            assert p["map_margin"] > 0.0
+            assert p["zero_mean_consistent"] is True
+            assert p["map_consistent"] is is_uniform
             assert 0 < p["hit"] <= 1 + 1e-12
             assert -1 <= p["miss"] < 0
 
@@ -137,7 +137,16 @@ def test_notebook_initialization_uses_actual_datasets(calibrated):
     assert env["ACOUSTIC_PAYOFF_MATRICES"] == cal["matrices"]
     assert env["EMOTION_PRIORS"]["neutral"] == .35
     assert env["EMOTION_MATRIX_PROOF"]["zero_mean_satisfied"] is True
+    assert env["EMOTION_MATRIX_PROOF"]["map_satisfied"] is False
+
+    # Toggling global flags to MAP mode re-calibrates R1 and R2 to universal MAP matrices
+    env.update(USE_ZERO_MEAN=False, USE_MAP=True)
+    exec(cell_source("def calibrate_emotion_payoffs("), env)
+    exec(cell_source("def reward_acoustic_inventory("), env)
     assert env["EMOTION_MATRIX_PROOF"]["map_satisfied"] is True
+    assert env["EMOTION_MATRIX_PROOF"]["zero_mean_satisfied"] is False
+    assert all(p["map_satisfied"] is True for p in env["ACOUSTIC_MATRIX_PROOFS"].values())
+    assert all(p["zero_mean_satisfied"] is False for p in env["ACOUSTIC_MATRIX_PROOFS"].values())
 
 
 def test_r1_every_emotion_zero_mean_and_valid_misses_equal(calibrated):
@@ -216,19 +225,111 @@ def test_missing_gt_preserves_baseline_and_train_eval_agreement(calibrated):
 def test_balanced_decision_rule_and_rare_class_bounds(env):
     f = np.array([.6, .15, .15, .1])
     cats = ("modal/normal", "pressed/tense", "breathy", "harsh/creaky")
-    payoff = env["get_voice_quality_payoff_matrix"](dict(zip(cats, f)))
+    payoff = env["get_voice_quality_payoff_matrix"](dict(zip(cats, f)), use_zero_mean=True, use_map=False)
     matrix = np.array([[payoff[t][p] for p in cats] for t in cats])
     likelihood = np.random.default_rng(3).dirichlet([2.] * 4, size=1000)
     posterior = f * likelihood
     posterior /= posterior.sum(axis=1, keepdims=True)
-    # Expected reward under posterior q is exactly (q - f), preserving unit slope and MAP prior
+    # Zero-Mean: expected reward under posterior q is (q - f)
     np.testing.assert_allclose(posterior @ matrix, posterior - f, atol=1e-12)
     for target_idx in range(len(cats)):
         q_target = 0.75 * f + 0.25 * np.eye(len(cats))[target_idx]
         assert int((q_target @ matrix).argmax()) == target_idx
+
+    # MAP mode: expected reward under posterior q is (q - sum(f^2)), matching argmax(q) universally
+    map_payoff = env["get_voice_quality_payoff_matrix"](dict(zip(cats, f)), use_zero_mean=False, use_map=True)
+    map_matrix = np.array([[map_payoff[t][p] for p in cats] for t in cats])
+    prior_baseline = float(np.sum(f ** 2))
+    np.testing.assert_allclose(posterior @ map_matrix, posterior - prior_baseline, atol=1e-12)
+    np.testing.assert_array_equal((posterior @ map_matrix).argmax(axis=1), posterior.argmax(axis=1))
+
     rare = env["compute_zero_mean_hit_miss"](dict(low=1e-9, moderate=.7, high=.3 - 1e-9))
     assert max(x["hit"] for x in rare.values()) == pytest.approx(1.)
     assert all(x["delta"] == pytest.approx(1.) for x in rare.values())
+
+
+def test_mutually_exclusive_flags_reject_invalid_combinations(calibrated):
+    env, raw, grpo, val, _, kwargs = calibrated
+    text = env["build_sample_completion"]()
+    for bad_zm, bad_map in [(True, True), (False, False)]:
+        with pytest.raises(ValueError, match="(?i)mutually exclusive|exactly one"):
+            env["resolve_reward_mode"](bad_zm, bad_map)
+        with pytest.raises(ValueError):
+            env["compute_hit_miss"](dict(a=1, b=2), use_zero_mean=bad_zm, use_map=bad_map)
+        with pytest.raises(ValueError):
+            env["calibrate_emotion_payoffs"](grpo, use_zero_mean=bad_zm, use_map=bad_map)
+        with pytest.raises(ValueError):
+            env["calibrate_acoustic_payoffs"](grpo, raw, val, use_zero_mean=bad_zm, use_map=bad_map)
+        with pytest.raises(ValueError):
+            env["reward_label_accuracy_weighted"](
+                ["p"] * len(grpo), [text] * len(grpo), use_zero_mean=bad_zm, use_map=bad_map, **kwargs
+            )
+        with pytest.raises(ValueError):
+            env["reward_acoustic_inventory"](
+                ["p"] * len(grpo), [text] * len(grpo), use_zero_mean=bad_zm, use_map=bad_map, **kwargs
+            )
+        with pytest.raises(ValueError):
+            env["unified_gated_grpo_reward"](
+                ["p"] * len(grpo), [text] * len(grpo), use_zero_mean=bad_zm, use_map=bad_map, **kwargs
+            )
+    with pytest.raises(ValueError, match="both"):
+        env["resolve_reward_mode"](True, None)
+
+    # Global flag mutation to invalid combination must also fail immediately
+    env["USE_ZERO_MEAN"] = True
+    env["USE_MAP"] = True
+    try:
+        with pytest.raises(ValueError, match="(?i)mutually exclusive|exactly one"):
+            env["compute_hit_miss"](dict(a=1, b=2))
+    finally:
+        env["USE_ZERO_MEAN"] = True
+        env["USE_MAP"] = False
+
+
+def test_map_mode_r1_r2_priors_and_train_eval_agreement(calibrated):
+    env, raw, grpo, val, _, kwargs = calibrated
+    env["USE_ZERO_MEAN"] = False
+    env["USE_MAP"] = True
+    try:
+        cal_map = env["calibrate_acoustic_payoffs"](grpo, raw, val)
+        emo_priors, emo_payoffs, emo_matrix = env["calibrate_emotion_payoffs"](grpo, return_matrix=True)
+        assert cal_map["mode"] == "map"
+
+        # R1 MAP: Hit = 1 - sum(p^2), Miss = -sum(p^2), prior-random expectation = 0
+        emo_b = sum(p * p for p in emo_priors.values())
+        for e, p_info in emo_payoffs.items():
+            assert p_info["hit"] == pytest.approx(1.0 - emo_b, abs=1e-12)
+            assert p_info["miss"] == pytest.approx(-emo_b, abs=1e-12)
+            scores = env["reward_label_accuracy_weighted"](
+                ["p"] * len(grpo), [env["build_sample_completion"](emotion=e)] * len(grpo),
+                emotion_priors=emo_priors, **kwargs,
+            )
+            assert np.mean(scores) == pytest.approx(emo_priors[e] - emo_b, abs=1e-12)
+        assert env["reward_label_accuracy_weighted"](
+            ["p"], [env["build_sample_completion"](emotion="invalid")],
+            emotion_priors=emo_priors, label=["joy"],
+        )[0] == -1.0
+
+        # R2 MAP: prior-weighted random cue baseline is 0.0 -> R2 = 0.5, and train/eval match
+        sample_text = env["build_sample_completion"]("elevated", "narrow", "loud", "fast", "pressed/tense", "anger")
+        r2_scores = env["reward_acoustic_inventory"](
+            ["p"] * len(grpo), [sample_text] * len(grpo),
+            priors_dict=cal_map["priors"], quantiles_dict=cal_map["quantiles"], **kwargs,
+        )
+        for score, (_, row) in zip(r2_scores, grpo.iterrows()):
+            diag = env["evaluate_single_prompt_acoustics"](
+                sample_text, row.audio_path, row.speaker, row_data=row.to_dict(),
+                quantiles_dict=cal_map["quantiles"], priors_dict=cal_map["priors"],
+            )
+            assert diag["r2_acoustic_reward"] == pytest.approx(score, abs=1e-12)
+
+        report_map = env["validate_grpo_reward_mathematics"]()
+        assert report_map["mode"] == "map"
+        assert report_map["r1_matrix_proof"]["map_satisfied"] is True
+        assert report_map["r1_matrix_proof"]["zero_mean_satisfied"] is False
+    finally:
+        env["USE_ZERO_MEAN"] = True
+        env["USE_MAP"] = False
 
 
 def test_composite_trace_and_internal_validation_preserve_live_calibration(calibrated):
