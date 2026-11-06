@@ -19,7 +19,8 @@ def cell_source(marker):
     return matches[0]
 
 
-def load_reward_environment():
+def load_reward_environment(*, use_zero_mean=True, use_map=False,
+                            use_inverse_frequency=False, use_distance_based_payoff=False):
     env = {"display": lambda *args: None}
     for marker in ("VALID_EMOTIONS =  {", "LABEL_SYNONYMS =", "REQUIRED_INVENTORY_KEYS =",
                    "import re\nfrom typing import Any", "def extract_acoustic_inventory(",
@@ -27,6 +28,11 @@ def load_reward_environment():
                    "def calibrate_emotion_payoffs(", "def reward_acoustic_inventory(",
                    "def compute_format_reward_from_parsed(", "REWARD_WEIGHTS ="):
         exec(compile(cell_source(marker), f"<notebook:{marker}>", "exec"), env)
+        if marker == "VALID_EMOTIONS =  {":
+            # Test cases select their modes explicitly, independently of experiment defaults.
+            env.update(USE_ZERO_MEAN=use_zero_mean, USE_MAP=use_map,
+                       USE_INVERSE_FREQUENCY=use_inverse_frequency,
+                       USE_DISTANCE_BASED_PAYOFF=use_distance_based_payoff)
     for marker, names in (
         ("def evaluate_grpo_validation(", {"INVENTORY_DIMENSIONS", "evaluate_single_prompt_acoustics"}),
         ("def validate_grpo_reward_mathematics(", {"build_sample_completion", "validate_grpo_reward_mathematics"}),
