@@ -50,6 +50,7 @@ def code():
     names = {'group_standardize', 'cue_group_advantages', 'acoustic_value_token_indices',
              'build_cue_token_advantages', 'completion_span_masks', 'compute_span_split_advantages',
              'build_span_split_token_advantages', 'dynamic_completion_loss'}
+    names.update({'fixed_completion_loss', 'reduce_completion_loss', 'validate_credit_assignment'})
     tree = ast.parse(cell_source('class AudioGRPOTrainer('))
     exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],
                             type_ignores=[]), '<notebook cue helpers>', 'exec'), env)
@@ -162,6 +163,158 @@ def test_grpo_loss_is_mean_of_completion_means(code):
     mask = tensor([[1., 1., 0.], [1., 0., 0.]])
     assert code['dynamic_completion_loss'](losses, mask) == pytest.approx(4.)
     assert code['dynamic_completion_loss'](losses, mask, 2) == pytest.approx(2.)
+
+
+def test_hybrid_preserves_emotion_and_format_but_not_cue_std(code):
+    rows = traces(code['R2_CUE_NAMES'])
+    # Nonconstant format tests that hybrid leaves the baseline R1/R3 interaction intact.
+    rows[1]['r3'] = .5
+    grpo = code['compute_span_split_advantages'](rows, 4, loss_type='grpo')
+    hybrid = code['compute_span_split_advantages'](rows, 4, loss_type='hybrid')
+    for key in ('adv_r1', 'adv_r3', 'adv_emotion'):
+        np.testing.assert_array_equal(hybrid[key], grpo[key])
+    cues = code['cue_group_advantages'](rows, 4, 2., loss_type='hybrid')
+    raw = np.array([.55, -.6, -.61, -.6])
+    np.testing.assert_allclose(cues['pitch_dynamics'], 2/5 * (raw - raw.mean()))
+    assert all(not cues[c].any() for c in cues if c != 'pitch_dynamics')
+    changed = copy.deepcopy(rows)
+    for i, row in enumerate(changed):
+        row['r1'] = 100 * i
+        row['r3'] = i**2
+        row['r2_cues']['pitch_dynamics']['raw'] *= .01
+        row['r2_cues']['voice_quality']['raw'] = i
+    scaled = code['cue_group_advantages'](changed, 4, 2., loss_type='hybrid')
+    np.testing.assert_allclose(scaled['pitch_dynamics'], .01*cues['pitch_dynamics'])
+
+
+def test_hybrid_tiny_wrong_answer_gap_is_not_amplified(code):
+    rows = [copy.deepcopy(row) for row in traces(code['R2_CUE_NAMES']) * 2]
+    for i, row in enumerate(rows):
+        row['r2_cues']['vocal_energy'].update(raw=-.628273 if i < 6 else -.638273)
+    hybrid = code['cue_group_advantages'](rows, 8, loss_type='hybrid')
+    np.testing.assert_allclose(hybrid['vocal_energy'], [.0005]*6 + [-.0015]*2)
+    grpo = code['cue_group_advantages'](rows, 8, loss_type='grpo')
+    assert grpo['vocal_energy'][0] > .1
+    for row in rows:
+        row['r2_cues']['vocal_energy'].update(valid_gt=False, truth=None)
+    assert not code['cue_group_advantages'](rows, 8, loss_type='hybrid')['vocal_energy'].any()
+    rows[0]['r2_cues']['pitch_height']['raw'] = float('nan')
+    with pytest.raises(ValueError, match='Nonfinite'):
+        code['cue_group_advantages'](rows, 8, loss_type='hybrid')
+
+
+@pytest.mark.parametrize('split,r2', [(False, False), (False, True), (True, False)])
+def test_hybrid_requires_both_splits(code, split, r2):
+    with pytest.raises(ValueError, match='hybrid requires'):
+        code['validate_credit_assignment']('hybrid', split, r2)
+
+
+def test_loss_modes_reject_unsupported_credit_and_preserve_old_modes(code):
+    validate = code['validate_credit_assignment']
+    validate('hybrid', True, True)
+    for mode in ('grpo', 'dr_grpo'):
+        validate(mode, False, False)
+        validate(mode, True, False)
+    validate('grpo', True, True)
+    with pytest.raises(ValueError):
+        validate('dr_grpo', True, True)
+    with pytest.raises(ValueError):
+        validate('typo', True, True)
+
+
+def test_hybrid_gradient_coefficients_dynamic_lengths_and_microbatches(code):
+    """Finite differences of actual masked surrogate: answer dilution, cue invariance."""
+    env = load_reward_environment()
+    tok = CharTokenizer()
+    first = env['build_sample_completion'](pitch_dynamics='wide')
+    second = env['build_sample_completion'](pitch_dynamics='moderate')
+    second = second.replace('[Prosodic Reasoning]', '[Prosodic Reasoning]' + ' Extra prose.'*20)
+    texts = [first, second]
+    width = max(map(len, texts)) + 4
+    ids = tensor([tok.encode(t) + [0]*(width-len(t)) for t in texts])
+    mask = tensor([[1]*len(t) + [0]*(width-len(t)) for t in texts])
+    cue_adv = {c: np.array([.02, -.02]) if c == 'pitch_dynamics' else np.zeros(2)
+               for c in code['R2_CUE_NAMES']}
+    adv, *_ = code['build_cue_token_advantages'](
+        ids, mask, cue_adv, tensor([.3, .3]), tensor([.7, .7]), tok)
+    reduce = code['reduce_completion_loss']
+    def objective(logps, maximum=2048):
+        return reduce(-np.exp(logps)*adv, mask, 'hybrid', maximum)
+    zero = tensor(np.zeros_like(ids, dtype=float))
+    for i, text in enumerate(texts):
+        positions, _ = code['acoustic_value_token_indices'](tok.encode(text), tok)
+        cue = positions['pitch_dynamics']
+        answer = text.index('<answer>') + len('<answer>')
+        for pos, expected in [(cue[0], -cue_adv['pitch_dynamics'][i]/len(cue)/2),
+                              (answer, -.7/len(text)/2), (len(text), 0.)]:
+            perturb = zero.copy()
+            perturb[i, pos] = 1e-5
+            derivative = (objective(perturb)-objective(-perturb))/(2e-5)
+            assert derivative == pytest.approx(expected, abs=1e-7)
+        assert -adv[i, cue].sum()/len(text)/2 == pytest.approx(-cue_adv['pitch_dynamics'][i]/2)
+    assert objective(zero, 512) == pytest.approx(objective(zero, 2048))
+    full = objective(zero)
+    split = sum(reduce(-adv[i:i+1], mask[i:i+1], 'hybrid', 2048, 2) for i in range(2))
+    assert full == pytest.approx(split)
+    np.testing.assert_allclose(reduce(-adv, mask, 'grpo', 2048), full)
+    assert reduce(-adv, mask, 'dr_grpo', 2048) == pytest.approx((-adv*mask).sum()/(2*2048))
+
+
+def test_hybrid_rollout_uses_cue_credit_and_never_scalar_reward(code):
+    import textwrap
+    source = cell_source('class AudioGRPOTrainer(')
+    start = source.index('      span_adv_dict = compute_span_split_advantages(')
+    end = source.index('      if self.accelerator.is_main_process:', start)
+    tok = CharTokenizer()
+    text = load_reward_environment()['build_sample_completion']()
+    ids = tensor([tok.encode(text)]*4)
+    mask = tensor([[1]*len(text)]*4)
+    def forbidden(*args):
+        raise AssertionError('Hybrid must not compute a scalar composite reward advantage')
+    trainer = SimpleNamespace(args=SimpleNamespace(loss_type='hybrid'),
+                              use_split_advantage=True, use_split_r2=True,
+                              processor=SimpleNamespace(tokenizer=tok),
+                              _compute_advantages=forbidden)
+    env = dict(code, self=trainer, reward_trace=traces(code['R2_CUE_NAMES']), g=4,
+               device=None, completion_ids=ids, completion_mask=mask)
+    exec(textwrap.dedent(source[start:end]), env)
+    positions, _ = code['acoustic_value_token_indices'](tok.encode(text), tok)
+    for cue, tokens in positions.items():
+        np.testing.assert_allclose(env['token_advantages'][:, tokens].sum(dim=1)/len(text),
+                                   env['cue_advantages'][cue], atol=1e-7)
+    answer = text.index('<answer>') + len('<answer>')
+    np.testing.assert_array_equal(env['token_advantages'][:, answer], env['span_adv_dict']['adv_emotion'])
+
+
+@pytest.mark.parametrize('mode', ['grpo', 'dr_grpo', 'hybrid'])
+def test_trainer_compute_loss_uses_selected_reduction(code, mode):
+    """Execute actual trainer method with CPU tensor shims and fixed log probabilities."""
+    from collections import defaultdict
+    from contextlib import nullcontext
+    from typing import Any, Dict
+    tree = ast.parse(cell_source('class AudioGRPOTrainer('))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'AudioGRPOTrainer')
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'compute_loss')
+    code.update(Dict=Dict, Any=Any, completion_logps=lambda model, inputs: tensor([[0., 0., 0.], [0., 0., 0.]]),
+                reference_policy=lambda *args: nullcontext())
+    code['torch'].no_grad = nullcontext
+    code['torch'].exp = lambda x: tensor(np.exp(x))
+    exec(compile(ast.Module(body=[method], type_ignores=[]), '<notebook compute_loss>', 'exec'), code)
+    model = SimpleNamespace(training=True)
+    trainer = SimpleNamespace(accelerator=SimpleNamespace(unwrap_model=lambda m: m),
+        args=SimpleNamespace(loss_type=mode, beta=0., max_completion_length=512),
+        reference_adapter_name=None, current_gradient_accumulation_steps=2,
+        _metrics=defaultdict(lambda: defaultdict(list)))
+    inputs = dict(completion_mask=tensor([[1., 1., 0.], [1., 0., 0.]]),
+                  token_advantages=tensor([[.4, .8, 99.], [-.2, 99., 99.]]),
+                  advantages=tensor([99., 99.]))
+    loss = code['compute_loss'](trainer, model, inputs)
+    expected = -.1 if mode in ('grpo', 'hybrid') else -1./(2*512*2)
+    assert loss == pytest.approx(expected)
+    if mode == 'hybrid':
+        del inputs['token_advantages']
+        with pytest.raises(ValueError, match='cue-specific token_advantages'):
+            code['compute_loss'](trainer, model, inputs)
 
 
 def test_real_reward_trace_matches_per_cue_evaluation(code):
