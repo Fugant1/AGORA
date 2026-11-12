@@ -129,3 +129,18 @@ def test_combined_evaluation_runs_once_after_training():
     assert 'thinker_max_new_tokens=512' in sources[evaluation]
     assert 'model.train(was_training)' in sources[evaluation]
     assert 'results_df.attrs["health_report_path"]' in sources[evaluation]
+
+
+@pytest.mark.parametrize('mode,normalization', [('hybrid', 'within_audio_mean_centered_raw'),
+    ('grpo', 'within_audio_sample_std_eps_1e-8'), ('dr_grpo', 'within_audio_mean_centered_raw')])
+def test_report_normalization_matches_selected_loss(tmp_path, reporting, mode, normalization):
+    from types import SimpleNamespace
+    env, train, results = reporting
+    args = SimpleNamespace(loss_type=mode, to_dict=lambda: {'loss_type': mode})
+    trainer = SimpleNamespace(args=args, state=None, use_split_r2=mode != 'dr_grpo', use_split_advantage=True)
+    path = env['write_grpo_health_report'](results, output_dir=tmp_path, trainer=trainer, train_df=train)
+    report = path.read_text()
+    assert f'"cue_advantage_normalization": "{normalization}"' in report
+    if mode == 'hybrid':
+        assert '"advantage_version": "cue_hybrid_v1"' in report
+        assert '"loss_reduction": "mean_of_completion_means"' in report
