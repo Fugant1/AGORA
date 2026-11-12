@@ -90,7 +90,7 @@ def test_metrics_detect_majority_collapse_and_invalid_answers(cue_env):
     assert m['accuracy'] == pytest.approx(1/3)
     assert m['macro_recall'] == pytest.approx(1/3)
     assert m['per_class']['low']['recall'] == 0.
-    for bad in ['low', '<answer>joy</answer>', '<answer>low</answer><answer>low</answer>']:
+    for bad in ['low or moderate', '<answer>joy</answer>', '<answer>low</answer><answer>low</answer>']:
         assert e['parse_sft_cue_answer'](bad, 'pitch_height') == 'invalid'
     assert e['parse_sft_cue_answer']('<answer> BREATHY </answer>', 'voice_quality') == 'breathy'
 
@@ -211,3 +211,17 @@ def test_shuffle_report_compares_same_eligible_tasks(cue_env, tmp_path):
     assert (tmp_path / 'comparison.json').exists()
     with pytest.raises(ValueError, match='at least two'):
         e['permute_sft_audio_within_speaker'](examples.iloc[[2]])
+
+
+def test_bare_labels_are_scored_separately_from_format(cue_env):
+    e = cue_env
+    assert e['parse_sft_cue_answer']('moderate', 'pitch_height') == 'moderate'
+    assert e['parse_sft_cue_answer']('moderate', 'pitch_height', strict_format=True) == 'invalid'
+    rows = [dict(cue_task='pitch_height', cue_truth=truth, completion=text, prediction='invalid')
+            for truth, text in [('low', 'moderate'), ('moderate', 'moderate'),
+                                ('low', '<answer>low</answer>')]]
+    m = e['sft_cue_metrics'](rows)['pitch_height']
+    assert m['accuracy'] == pytest.approx(2/3)
+    assert m['invalid_rate'] == 0.
+    assert m['format_valid_rate'] == pytest.approx(1/3)
+    assert m['strict_format_accuracy'] == pytest.approx(1/3)
