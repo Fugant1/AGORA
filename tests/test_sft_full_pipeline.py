@@ -19,6 +19,8 @@ def test_teacher_gets_transcript_gender_and_targets_student_gets_only_gender(env
     assert row['text'] in teacher and row['text'] not in student
     assert f"Target emotion: {row['emotion']}" in teacher and 'Target emotion:' not in student
     assert '3 numbered steps' in teacher
+    assert 'exactly 3 short numbered sentences' in teacher and '90 words' in teacher
+    assert '90 words' not in env['build_bridge_generation_prompt'](row, concise=False)
     assert f"- timbre: {row['timbre_cue']}" in teacher
     row.update(effective_gender='__GLOBAL__', text='UNTRUSTED', emotion='joy', pitch_level_cue='high')
     prompt = env['student_instruction'](row)
@@ -44,6 +46,10 @@ def test_teacher_checkpoint_reuses_targets_and_resumes_pending_rows(env, train, 
     cached = pd.read_csv(path)
     assert cached.reasoning.notna().sum() == 2
     assert set(frame.columns) <= set(cached.columns)
+    # A valid explanation from the previous prompt must survive this prompt-only revision.
+    legacy_prompt = env['build_bridge_generation_prompt'](frame.iloc[0], concise=False)
+    cached.loc[0, 'bridge_prompt'] = legacy_prompt
+    cached.to_csv(path, index=False)
     resumed = []
     def finish(model, processor, rows, teacher=False):
         resumed.extend(row['audio_path'] for row in rows)
@@ -58,6 +64,7 @@ def test_teacher_checkpoint_reuses_targets_and_resumes_pending_rows(env, train, 
     exec(''.join(cell['source']), env)
     result = env['sft_train']
     assert resumed == [frame.iloc[2].audio_path]
+    assert result.loc[0, 'bridge_prompt'] == legacy_prompt
     for _, row in result.iterrows():
         emotion, cues = env['parse_completion'](row.sft_gt)
         assert emotion == row.emotion
@@ -131,10 +138,12 @@ def test_validation_scores_emotion_and_saved_cues_with_missing_targets(env, trai
 ])
 def test_multimodal_generation_restores_state_and_handles_truncation(env, train, tmp_path, teacher, outcome, budgets):
     calls = []
+    text_config = SimpleNamespace(use_cache=False)
     class Batch(dict):
         def to(self, device): return self
     class Processor:
         tokenizer = SimpleNamespace(padding_side='right', pad_token_id=0,
+                                    get_vocab=lambda: {'<|im_end|>': 3, '<|endoftext|>': 2},
                                     batch_decode=lambda *a, **kw: ['explanation', 'explanation'])
         def apply_chat_template(self, messages, **kwargs):
             assert 'F (female)' in messages[1]['content'][1]['text']
@@ -145,12 +154,15 @@ def test_multimodal_generation_restores_state_and_handles_truncation(env, train,
     class Model:
         training = True
         device = 'cuda'
-        config = SimpleNamespace(use_cache=False)
-        generation_config = SimpleNamespace(eos_token_id=[2, 3] if outcome == 'eos_at_limit' else 2)
+        config = SimpleNamespace(get_text_config=lambda: text_config)
+        generation_config = SimpleNamespace(eos_token_id=99, use_cache=False)
         def eval(self): self.training = False
         def train(self, flag): self.training = flag
         def generate(self, **kwargs):
             assert 'labels' not in kwargs and not kwargs['do_sample']
+            assert kwargs['use_cache'] is True
+            assert kwargs['eos_token_id'] == [2, 3]  # Override defaults that omit im_end.
+            assert not self.training and processor.tokenizer.padding_side == 'left'
             limit = kwargs['max_new_tokens']
             calls.append(limit)
             if outcome == 'error': raise RuntimeError('failure')
@@ -181,8 +193,16 @@ def test_multimodal_generation_restores_state_and_handles_truncation(env, train,
     else:
         assert env['generate_completions'](model, processor, rows, teacher=teacher) == ['explanation', 'explanation']
     assert calls == budgets
-    assert model.training and not model.config.use_cache
+    assert model.training and not model.config.get_text_config().use_cache
+    assert not hasattr(model.config, 'use_cache')
+    assert model.generation_config.eos_token_id == 99 and not model.generation_config.use_cache
     assert processor.tokenizer.padding_side == 'right'
+
+
+def test_generation_requires_real_chat_stop_token(env):
+    with pytest.raises(ValueError, match='missing the <\\|im_end\\|>'):
+        env['generation_eos_ids'](SimpleNamespace(get_vocab=lambda: {'<|endoftext|>': 2}))
+    assert env['generation_eos_ids'](SimpleNamespace(get_vocab=lambda: {'<|im_end|>': 0})) == [0]
 
 
 def test_notebook_removes_legacy_custom_validation_and_refitting():

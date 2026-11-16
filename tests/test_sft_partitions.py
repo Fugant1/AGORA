@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import tarfile
 
 import numpy as np
 import pandas as pd
@@ -17,7 +18,8 @@ NOTEBOOK = Path(__file__).resolve().parents[1] / 'ser_sft.ipynb'
 
 @pytest.fixture
 def env():
-    scope = dict(Path=Path, hashlib=hashlib, json=json, re=re, np=np, pd=pd,
+    scope = dict(Path=Path, hashlib=hashlib, json=json, re=re, tarfile=tarfile, np=np, pd=pd,
+                 DATA_DIR=Path('/clean'), DRIVE_DATA_DIR=Path('/clean'),
                  milp=milp, Bounds=Bounds, LinearConstraint=LinearConstraint,
                  csr_matrix=csr_matrix, eye=eye, hstack=hstack, vstack=vstack,
                  accuracy_score=accuracy_score, precision_recall_fscore_support=precision_recall_fscore_support,
@@ -26,7 +28,8 @@ def env():
     for cell in json.loads(NOTEBOOK.read_text())['cells']:
         if cell['cell_type'] != 'code':
             continue
-        tree = ast.parse(''.join(cell['source']))
+        source = ''.join(line for line in cell['source'] if not line.lstrip().startswith(('%', '!')))
+        tree = ast.parse(source)
         nodes = []
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
@@ -122,11 +125,14 @@ def test_drive_cache_reloads_preserves_reasoning_and_rejects_stale_provenance(en
     quartiles = tmp_path / 'quartiles.json'
     quartiles.write_text('{}')
     split = tmp_path / 'splits'
-    env.update(DATA_DIR=data, TRAIN_CSV=train_csv, QUARTILES_JSON=quartiles,
+    env.update(DATA_DIR=data, DRIVE_DATA_DIR=data, TRAIN_CSV=train_csv, QUARTILES_JSON=quartiles,
                SPLIT_DIR=split, SFT_CSV=split/'sft_train.csv', GRPO_CSV=split/'grpo_train.csv',
                SPLIT_META=split/'split_manifest.json')
     val = pd.DataFrame({'audio_path': []})
+    current_prompt = env['PROMPT_VERSION']
+    env['PROMPT_VERSION'] = 'gender_transcript_teacher_v1'
     sft, grpo, _ = env['load_or_create_partitions'](train, val)
+    env['PROMPT_VERSION'] = current_prompt
     sft['reasoning'] = 'cached explanation'
     sft.to_csv(env['SFT_CSV'], index=False)
     def forbidden(*args): raise AssertionError('Must load saved splits')
