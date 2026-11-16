@@ -120,12 +120,24 @@ def test_loss_masks_prompt_and_padding_but_preserves_eos(env):
 
 @pytest.mark.parametrize('fail', [False, True])
 def test_generation_has_no_targets_and_restores_state(env, fail):
+    bars = []
+    class Progress:
+        def __init__(self, **kwargs):
+            self.settings = kwargs
+            self.updates = []
+            self.closed = False
+            bars.append(self)
+        def __enter__(self): return self
+        def __exit__(self, *args): self.closed = True
+        def update(self, amount): self.updates.append(amount)
+    env['tqdm'] = Progress
+
     class Batch(dict):
         def to(self, device): return self
 
     class Processor:
         tokenizer = SimpleNamespace(padding_side='right', pad_token_id=0,
-                                    batch_decode=lambda *a, **kw: ['<answer>low</answer>'])
+                                    batch_decode=lambda ids, **kw: ['<answer>low</answer>'] * len(ids))
 
         def apply_chat_template(self, messages, **kwargs):
             assert len(messages) == 2
@@ -133,7 +145,7 @@ def test_generation_has_no_targets_and_restores_state(env, fail):
             return 'prompt'
 
         def __call__(self, **kwargs):
-            return Batch(input_ids=np.ones((1, 3)))
+            return Batch(input_ids=np.ones((len(kwargs['text']), 3)))
 
     class Model:
         training = True
@@ -144,19 +156,23 @@ def test_generation_has_no_targets_and_restores_state(env, fail):
         def generate(self, **kwargs):
             assert 'labels' not in kwargs and not kwargs['do_sample']
             if fail: raise RuntimeError('generation failed')
-            return np.ones((1, 5))
+            return np.ones((len(kwargs['input_ids']), 5))
 
     model, processor = Model(), Processor()
     env['load_audio'] = lambda p: np.zeros(16)
     frame = pd.DataFrame([dict(audio_path='a.wav', cue='pitch_level', truth='low',
                                effective_gender='F', instruction=env['cue_instruction']('pitch_level', 'F'),
-                               sft_gt='must never enter prompt')])
+                               sft_gt='must never enter prompt')] * 3)
     if fail:
         with pytest.raises(RuntimeError):
             env['evaluate_generated'](model, processor, frame)
     else:
         _, metrics = env['evaluate_generated'](model, processor, frame)
         assert metrics['pitch_level']['accuracy'] == 1.0
+    assert bars[0].settings['total'] == 3
+    assert '{remaining}' in bars[0].settings['bar_format']
+    assert bars[0].updates == ([] if fail else [2, 1])
+    assert bars[0].closed
     assert model.training and not model.config.use_cache
     assert processor.tokenizer.padding_side == 'right'
 
