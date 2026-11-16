@@ -48,8 +48,15 @@ def test_teacher_checkpoint_reuses_targets_and_resumes_pending_rows(env, train, 
     def finish(model, processor, rows, teacher=False):
         resumed.extend(row['audio_path'] for row in rows)
         return ['1. Remaining. 2. Evidence. 3. Emotion.'] * len(rows)
-    env['generate_completions'] = finish
-    result = env['generate_sft_train'](None, None, cached, path)
+    # Rerun the execution cell with the stale in-memory frame left by the exception.
+    env.update(generate_completions=finish, model=None, processor=None, sft_train=frame,
+               SFT_CSV=path, GENERATION_BATCH_SIZE=2, clean_train_set=train, val_set=pd.DataFrame(),
+               load_or_create_partitions=lambda *args: (pd.read_csv(path), pd.DataFrame(), {}),
+               validate_partitions=lambda *args: None)
+    cell = next(c for c in json.loads(NOTEBOOK.read_text())['cells']
+                if c['id'] == 'ser-sft-15')
+    exec(''.join(cell['source']), env)
+    result = env['sft_train']
     assert resumed == [frame.iloc[2].audio_path]
     for _, row in result.iterrows():
         emotion, cues = env['parse_completion'](row.sft_gt)
@@ -114,38 +121,66 @@ def test_validation_scores_emotion_and_saved_cues_with_missing_targets(env, trai
         assert env['parse_completion'](text)[0] == 'invalid'
 
 
-@pytest.mark.parametrize('fail', [False, True])
-def test_multimodal_generation_restores_state_and_never_passes_labels(env, train, fail):
+@pytest.mark.parametrize('teacher, outcome, budgets', [
+    (True, 'complete', [10]),
+    (True, 'error', [10]),
+    (True, 'retry', [10, 20]),
+    (True, 'truncated', [10, 20]),
+    (True, 'eos_at_limit', [10]),
+    (False, 'truncated', [10]),
+])
+def test_multimodal_generation_restores_state_and_handles_truncation(env, train, tmp_path, teacher, outcome, budgets):
+    calls = []
     class Batch(dict):
         def to(self, device): return self
     class Processor:
         tokenizer = SimpleNamespace(padding_side='right', pad_token_id=0,
-                                    batch_decode=lambda *a, **kw: ['explanation'])
+                                    batch_decode=lambda *a, **kw: ['explanation', 'explanation'])
         def apply_chat_template(self, messages, **kwargs):
             assert 'F (female)' in messages[1]['content'][1]['text']
             return 'prompt'
         def __call__(self, **kwargs):
             assert 'audio' in kwargs
-            return Batch(input_ids=np.ones((1, 3)))
+            return Batch(input_ids=np.ones((2, 3)))
     class Model:
         training = True
         device = 'cuda'
         config = SimpleNamespace(use_cache=False)
-        generation_config = SimpleNamespace(eos_token_id=2)
+        generation_config = SimpleNamespace(eos_token_id=[2, 3] if outcome == 'eos_at_limit' else 2)
         def eval(self): self.training = False
         def train(self, flag): self.training = flag
         def generate(self, **kwargs):
             assert 'labels' not in kwargs and not kwargs['do_sample']
-            if fail: raise RuntimeError('failure')
-            return np.array([[1, 1, 1, 9, 2]])
+            limit = kwargs['max_new_tokens']
+            calls.append(limit)
+            if outcome == 'error': raise RuntimeError('failure')
+            if outcome == 'truncated' or (outcome == 'retry' and len(calls) == 1):
+                sequence = [9] * limit
+            elif outcome == 'eos_at_limit':
+                sequence = [9] * (limit - 1) + [3]
+            else:
+                sequence = [9, 2]
+            # The other sequence already ended and is padded to the batch's length.
+            return np.array([[1, 1, 1, 9, 2] + [0] * (len(sequence) - 2), [1, 1, 1] + sequence])
     env.update(torch=SimpleNamespace(inference_mode=nullcontext, autocast=lambda *a, **k: nullcontext()),
                compute_dtype='bf16', MAX_NEW_TOKENS=10, load_audio=lambda p: np.zeros(16))
     model, processor = Model(), Processor()
-    if fail:
-        with pytest.raises(RuntimeError):
-            env['generate_completions'](model, processor, train.head(1).to_dict('records'), teacher=True)
+    rows = train.head(2).to_dict('records')
+    if outcome == 'error':
+        with pytest.raises(RuntimeError, match='failure'):
+            env['generate_completions'](model, processor, rows, teacher=teacher)
+    elif teacher and outcome == 'truncated':
+        path = tmp_path / 'sft.csv'
+        train.head(2).to_csv(path, index=False)
+        saved = path.read_bytes()
+        with pytest.raises(ValueError, match='still incomplete after 20 tokens') as error:
+            env['generate_sft_train'](model, processor, train.head(2), path)
+        assert rows[1]['audio_path'] in str(error.value)
+        assert rows[0]['audio_path'] not in str(error.value)
+        assert path.read_bytes() == saved
     else:
-        assert env['generate_completions'](model, processor, train.head(1).to_dict('records'), teacher=True) == ['explanation']
+        assert env['generate_completions'](model, processor, rows, teacher=teacher) == ['explanation', 'explanation']
+    assert calls == budgets
     assert model.training and not model.config.use_cache
     assert processor.tokenizer.padding_side == 'right'
 
