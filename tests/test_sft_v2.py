@@ -24,7 +24,8 @@ def env():
     for cell in json.loads(NOTEBOOK.read_text())['cells']:
         if cell['cell_type'] != 'code':
             continue
-        tree = ast.parse(''.join(cell['source']))
+        source = ''.join(line for line in cell['source'] if not line.lstrip().startswith(('%', '!')))
+        tree = ast.parse(source)
         nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))
                  or (isinstance(node, ast.Assign) and any(
                      (isinstance(t, ast.Name) and t.id in constants)
@@ -160,31 +161,79 @@ def test_generation_has_no_targets_and_restores_state(env, fail):
     assert processor.tokenizer.padding_side == 'right'
 
 
-def test_drive_archive_restores_only_missing_clean_audio(env, tmp_path):
+def write_drive_export(root):
+    clean = root / 'emo_tag_clean'
+    for split in ('train', 'val'):
+        audio = clean / split / 'sample.wav'
+        audio.parent.mkdir(parents=True, exist_ok=True)
+        audio.write_bytes(split.encode())
+        # Original preprocessing CSVs can point at a previous runtime.
+        pd.DataFrame([{'audio_path': f'/old/runtime/meld_16k_mono/emo_tag_clean/{split}/sample.wav'}]).to_csv(
+            clean / f'clean_{split}_set_with_cues.csv', index=False)
+    (clean / 'gender_acoustic_quartiles.json').write_text('{"reference": "saved"}')
+
+
+def test_missing_archive_is_created_on_drive_and_audio_is_staged_locally(env, tmp_path):
+    import tarfile
+    drive = tmp_path / 'Drive/meld_16k_mono'
+    local = tmp_path / 'runtime/meld_16k_mono'
+    write_drive_export(drive)
+    env['stage_clean_data'](drive, local)
+    archive = drive / 'meld_16k_mono_clean.tar'
+    assert archive.is_file()
+    with tarfile.open(archive) as bundle:
+        assert 'meld_16k_mono/emo_tag_clean/train/sample.wav' in bundle.getnames()
+        assert 'meld_16k_mono/emo_tag_clean/gender_acoustic_quartiles.json' in bundle.getnames()
+    assert (local / 'emo_tag_clean/train/sample.wav').read_bytes() == b'train'
+    assert (local / 'emo_tag_clean/val/sample.wav').read_bytes() == b'val'
+    assert (local.parent / archive.name).read_bytes() == archive.read_bytes()
+    assert not list(tmp_path.rglob('*.partial'))
+    frame = pd.read_csv(local / 'emo_tag_clean/clean_train_set_with_cues.csv')
+    resolved = env['resolve_audio_path'](frame.audio_path.iloc[0], 'train', local)
+    assert resolved == str(local / 'emo_tag_clean/train/sample.wav')
+    original_archive = archive.read_bytes()
+    # New runtime must restore using the archive even when unpacked Drive WAVs are gone.
+    (drive / 'emo_tag_clean/train/sample.wav').unlink()
+    (drive / 'emo_tag_clean/val/sample.wav').unlink()
+    fresh = tmp_path / 'fresh_runtime/meld_16k_mono'
+    env['stage_clean_data'](drive, fresh)
+    assert archive.read_bytes() == original_archive
+    assert (fresh / 'emo_tag_clean/train/sample.wav').read_bytes() == b'train'
+
+
+def test_existing_preprocessing_tar_excludes_raw_audio_and_unsafe_members(env, tmp_path):
     import io
     import tarfile
-    root = tmp_path / 'Drive/meld_16k_mono'
-    root.mkdir(parents=True)
-    existing = root / 'emo_tag_clean/train/existing.wav'
-    existing.parent.mkdir(parents=True)
-    existing.write_bytes(b'keep')
-    with tarfile.open(root / 'meld_16k_mono_clean.tar', 'w') as archive:
-        for name in ['emo_tag_clean/train/existing.wav', 'emo_tag_clean/val/new.wav',
-                     'emo_tag_clean/clean_val_set_with_cues.csv', 'emo_tag_clean/test/test.wav',
-                     'emo_tag_clean/val/../../escape.wav']:
-            member = tarfile.TarInfo('meld_16k_mono/' + name)
+    drive = tmp_path / 'Drive/meld_16k_mono'
+    local = tmp_path / 'runtime/meld_16k_mono'
+    write_drive_export(drive)
+    archive = drive / 'meld_16k_mono_clean.tar'
+    with tarfile.open(archive, 'w') as bundle:
+        bundle.add(drive / 'emo_tag_clean', arcname='meld_16k_mono/emo_tag_clean')
+        for name in ['meld_16k_mono/train/raw.wav', 'meld_16k_mono/emo_tag_clean/val/../../escape.wav',
+                     '/tmp/escape.wav']:
+            member = tarfile.TarInfo(name)
             member.size = 5
-            archive.addfile(member, io.BytesIO(b'audio'))
-    env['restore_clean_audio'](root)
-    assert existing.read_bytes() == b'keep'
-    assert (root / 'emo_tag_clean/val/new.wav').read_bytes() == b'audio'
-    assert len(list(root.rglob('*.wav'))) == 2
-    assert not list(root.rglob('*.csv'))
-    env['restore_clean_audio'](root)
-    assert existing.read_bytes() == b'keep'
-    resolved = env['resolve_audio_path'](
-        '/content/agora_work/meld_16k_mono/emo_tag_clean/val/new.wav', 'val', root)
-    assert resolved == str(root / 'emo_tag_clean/val/new.wav')
+            bundle.addfile(member, io.BytesIO(b'audio'))
+        link = tarfile.TarInfo('meld_16k_mono/emo_tag_clean/val/link.wav')
+        link.type = tarfile.SYMTYPE
+        link.linkname = '/tmp/escape.wav'
+        bundle.addfile(link)
+    env['stage_clean_data'](drive, local)
+    assert len(list(local.rglob('*.wav'))) == 2
+    assert not (local / 'train').exists()
+    assert not (local / 'emo_tag_clean/val/link.wav').exists()
+
+
+def test_missing_drive_audio_fails_before_archive_is_published(env, tmp_path):
+    drive = tmp_path / 'Drive/meld_16k_mono'
+    write_drive_export(drive)
+    (drive / 'emo_tag_clean/train/sample.wav').unlink()
+    with pytest.raises(FileNotFoundError):
+        env['stage_clean_data'](drive, tmp_path / 'runtime/meld_16k_mono')
+    assert not (drive / 'meld_16k_mono_clean.tar').exists()
+    with pytest.raises(ValueError, match='outside Drive'):
+        env['stage_clean_data'](drive, drive / 'local')
 
 
 @pytest.mark.parametrize('gender', ['F', 'M', '__GLOBAL__'])
@@ -231,3 +280,29 @@ def test_manifest_rejects_missing_or_unknown_reference_group(env, tmp_path, gend
     pd.DataFrame([row]).drop(columns='effective_gender').to_csv(csv, index=False)
     with pytest.raises(ValueError, match='missing columns'):
         env['load_manifest'](csv, 'val', tmp_path)
+
+
+def test_stale_local_audio_cannot_hide_an_incomplete_archive(env, tmp_path):
+    import tarfile
+    drive = tmp_path / 'Drive/meld_16k_mono'
+    local = tmp_path / 'runtime/meld_16k_mono'
+    write_drive_export(drive)
+    write_drive_export(local)
+    # This archive omits train/sample.wav, which is already present locally.
+    with tarfile.open(drive / 'meld_16k_mono_clean.tar', 'w') as bundle:
+        bundle.add(drive / 'emo_tag_clean/val', arcname='meld_16k_mono/emo_tag_clean/val')
+    with pytest.raises(ValueError, match='Archive is missing'):
+        env['stage_clean_data'](drive, local)
+
+
+def test_archive_creation_failure_does_not_publish_partial_tar(env, tmp_path, monkeypatch):
+    import tarfile
+    drive = tmp_path / 'Drive/meld_16k_mono'
+    write_drive_export(drive)
+    def interrupted(*args, **kwargs):
+        raise OSError('interrupted archive write')
+    monkeypatch.setattr(tarfile.TarFile, 'add', interrupted)
+    with pytest.raises(OSError, match='interrupted'):
+        env['stage_clean_data'](drive, tmp_path / 'runtime/meld_16k_mono')
+    assert not (drive / 'meld_16k_mono_clean.tar').exists()
+    assert not list(drive.rglob('*.partial'))
