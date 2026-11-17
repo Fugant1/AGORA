@@ -19,7 +19,9 @@ def env():
     import tarfile
     scope = dict(tarfile=tarfile, Path=Path, pd=pd, np=np, re=re, accuracy_score=accuracy_score,
                  precision_recall_fscore_support=precision_recall_fscore_support,
-                 Dataset=object, torch=SimpleNamespace(inference_mode=nullcontext))
+                 Dataset=object, Trainer=object,
+                 torch=SimpleNamespace(inference_mode=nullcontext, float32=np.float32,
+                                       tensor=lambda value, dtype=None: tensor(value)))
     constants = {'CUES', 'CUE_LABELS', 'CUE_DESCRIPTIONS', 'PERSONA'}
     for cell in json.loads(NOTEBOOK.read_text())['cells']:
         if cell['cell_type'] != 'code':
@@ -85,7 +87,8 @@ def test_metrics_count_invalid_and_detect_collapse(env):
     assert result['per_class']['high']['recall'] == 0
     rows['prediction'] = ['invalid', 'moderate', 'invalid']
     assert env['cue_metrics'](rows)['pitch_level']['invalid_rate'] == pytest.approx(2 / 3)
-    for bad in ['low', '<answer>low</answer><answer>high</answer>', '<answer>elevated</answer>']:
+    for bad in ['low', '<answer>low</answer><answer>high</answer>', '<answer>elevated</answer>',
+                '<answer>low', '<answer>low</answer>Human: continue']:
         assert env['parse_answer'](bad, 'pitch_level') == 'invalid'
     assert env['parse_answer']('<answer>high (tense/bright)</answer>', 'timbre') == 'high (tense/bright)'
 
@@ -137,7 +140,10 @@ def test_generation_has_no_targets_and_restores_state(env, fail):
 
     class Processor:
         tokenizer = SimpleNamespace(padding_side='right', pad_token_id=0,
-                                    batch_decode=lambda ids, **kw: ['<answer>low</answer>'] * len(ids))
+                                    get_vocab=lambda: {'<|im_end|>': 9, '<|endoftext|>': 10},
+                                    batch_decode=lambda ids, skip_special_tokens: [
+                                        '<answer>low</answer>' + ('' if skip_special_tokens else '<|im_end|>')
+                                    ] * len(ids))
 
         def apply_chat_template(self, messages, **kwargs):
             assert len(messages) == 2
@@ -155,8 +161,12 @@ def test_generation_has_no_targets_and_restores_state(env, fail):
         def train(self, value): self.training = value
         def generate(self, **kwargs):
             assert 'labels' not in kwargs and not kwargs['do_sample']
+            assert kwargs['use_cache'] is True
+            assert kwargs['eos_token_id'] == [9, 10]
+            assert kwargs['stop_strings'] == ['</answer>']
+            assert kwargs['tokenizer'] is processor.tokenizer
             if fail: raise RuntimeError('generation failed')
-            return np.ones((len(kwargs['input_ids']), 5))
+            return np.array([[1, 1, 1, 4, 9]] * len(kwargs['input_ids']))
 
     model, processor = Model(), Processor()
     env['load_audio'] = lambda p: np.zeros(16)
@@ -165,16 +175,192 @@ def test_generation_has_no_targets_and_restores_state(env, fail):
                                sft_gt='must never enter prompt')] * 3)
     if fail:
         with pytest.raises(RuntimeError):
-            env['evaluate_generated'](model, processor, frame)
+            env['evaluate_generated'](model, processor, frame, batch_size=2)
     else:
-        _, metrics = env['evaluate_generated'](model, processor, frame)
+        records, metrics = env['evaluate_generated'](model, processor, frame, batch_size=2)
         assert metrics['pitch_level']['accuracy'] == 1.0
+        assert records.raw_completion.str.endswith('<|im_end|>').all()
+        assert not records.hit_token_limit.any()
     assert bars[0].settings['total'] == 3
     assert '{remaining}' in bars[0].settings['bar_format']
     assert bars[0].updates == ([] if fail else [2, 1])
     assert bars[0].closed
     assert model.training and not model.config.use_cache
     assert processor.tokenizer.padding_side == 'right'
+
+
+def test_end_of_turn_is_required_even_if_default_eos_exists(env):
+    with pytest.raises(ValueError, match='im_end'):
+        env['generation_eos_ids'](SimpleNamespace(get_vocab=lambda: {'<|endoftext|>': 10}))
+
+
+def test_inverse_frequency_weights_balance_each_cue_from_training_counts(env):
+    examples = pd.DataFrame([
+        dict(cue=cue, truth=label)
+        for cue, counts in [('pitch_level', (2, 4, 2)), ('timbre', (1, 2, 3))]
+        for label, count in zip(env['CUE_LABELS'][cue], counts)
+        for _ in range(count)
+    ])
+    weights = env['inverse_frequency_weights'](examples)
+    pitch = weights[weights.cue == 'pitch_level'].set_index('label')
+    assert pitch.loc['moderate', 'weight'] == pytest.approx(2 / 3)
+    assert pitch.loc['low', 'weight'] == pytest.approx(4 / 3)
+    assert pitch.loc['high', 'weight'] == pytest.approx(4 / 3)
+    for _, group in weights.groupby('cue'):
+        assert (group['count'] * group.weight).values == pytest.approx([group['count'].sum() / 3] * 3)
+        assert np.average(group.weight, weights=group['count']) == pytest.approx(1.)
+    assert len(weights[weights.cue == 'timbre']) == 3
+    for bad in [examples.iloc[:0], examples[examples.truth != 'high'],
+                pd.DataFrame([dict(cue='pitch_level', truth='unknown')])]:
+        with pytest.raises(ValueError):
+            env['inverse_frequency_weights'](bad)
+
+
+def test_weighted_loss_shifts_masks_normalizes_lengths_and_preserves_singleton_weights(env):
+    torch = pytest.importorskip('torch')
+    env['torch'] = torch
+    fn = env['weighted_answer_loss']
+    torch.manual_seed(42)
+    logits = torch.randn(2, 5, 4, requires_grad=True)
+    # Token 0 is both EOS and padding; only the attention-derived -100 mask excludes padding.
+    labels = torch.tensor([[-100, -100, 2, 0, -100], [-100, 3, 2, 1, 0]])
+    weights = torch.tensor([4 / 3, 2 / 3])
+    nll = -logits.log_softmax(-1)
+    expected = ((nll[0, 1, 2] + nll[0, 2, 0]) / 2 * weights[0]
+                + (nll[1, 0, 3] + nll[1, 1, 2] + nll[1, 2, 1] + nll[1, 3, 0]) / 4 * weights[1]) / 2
+    loss = fn(logits, labels, weights)
+    torch.testing.assert_close(loss, expected)
+    singleton = fn(logits[:1], labels[:1], weights[:1])
+    torch.testing.assert_close(singleton, fn(logits[:1], labels[:1], torch.ones(1)) * weights[0])
+    split = sum(fn(logits[i:i+1], labels[i:i+1], weights[i:i+1]) for i in range(2)) / 2
+    torch.testing.assert_close(loss, split)
+    grad = torch.autograd.grad(loss, logits, retain_graph=True)[0]
+    torch.testing.assert_close(grad, torch.autograd.grad(split, logits)[0])
+    assert grad[0, 0].abs().sum() == 0  # Prompt.
+    assert grad[0, 3:].abs().sum() == 0  # Padding and final unused next-token position.
+    assert grad[0, 2].abs().sum() > 0  # EOS is supervised.
+    for invalid in [torch.tensor([0., 1.]), torch.tensor([float('nan'), 1.]), torch.ones(3)]:
+        with pytest.raises(ValueError, match='weight'):
+            fn(logits, labels, invalid)
+    with pytest.raises(ValueError, match='supervised'):
+        fn(logits, torch.full_like(labels, -100), weights)
+
+
+def test_weighted_trainer_consumes_weights_without_exposing_them_to_model(env):
+    torch = pytest.importorskip('torch')
+    env['torch'] = torch
+    logits = torch.zeros(1, 3, 4, requires_grad=True)
+    def model(**kwargs):
+        assert set(kwargs) == {'input_ids', 'use_cache'}
+        assert kwargs['use_cache'] is False
+        return SimpleNamespace(logits=logits)
+    inputs = dict(input_ids=torch.tensor([[1, 2, 0]]), labels=torch.tensor([[-100, 2, 0]]),
+                  loss_weights=torch.tensor([4 / 3]))
+    trainer = env['CueWeightedTrainer']()
+    loss, outputs = trainer.compute_loss(model, inputs, return_outputs=True, num_items_in_batch=100)
+    assert trainer.loss_is_scaled_for_ga is False
+    torch.testing.assert_close(loss, torch.tensor(np.log(4) * 4 / 3, dtype=torch.float32))
+    assert outputs.logits is logits and 'labels' in inputs and 'loss_weights' in inputs
+    loss.backward()
+    assert logits.grad.abs().sum() > 0
+
+
+def test_real_trainer_accumulation_matches_full_batch(env, tmp_path):
+    torch = pytest.importorskip('torch')
+    transformers = pytest.importorskip('transformers')
+    env.update(torch=torch, Trainer=transformers.Trainer)
+    cells = json.loads(NOTEBOOK.read_text())['cells']
+    tree = ast.parse(next(''.join(c['source']) for c in cells
+                         if 'class CueWeightedTrainer(' in ''.join(c['source'])))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'CueWeightedTrainer')
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(NOTEBOOK), 'exec'), env)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.table = torch.nn.Parameter(torch.arange(16, dtype=torch.float32).reshape(4, 4) / 16)
+
+        def forward(self, input_ids, use_cache=False):
+            assert use_cache is False
+            return transformers.modeling_outputs.CausalLMOutput(logits=self.table[input_ids])
+
+    dataset = [dict(input_ids=[1, 2, 0], labels=[-100, 2, 0], loss_weights=4 / 3),
+               dict(input_ids=[1, 3, 0], labels=[-100, 3, 0], loss_weights=2 / 3)]
+    tables = []
+    for batch_size, accumulation in [(2, 1), (1, 2)]:
+        model = Model()
+        args = transformers.TrainingArguments(
+            output_dir=str(tmp_path / str(batch_size)), use_cpu=True, max_steps=1,
+            per_device_train_batch_size=batch_size, gradient_accumulation_steps=accumulation,
+            remove_unused_columns=False, label_names=['labels'], prediction_loss_only=True,
+            save_strategy='no', report_to='none', disable_tqdm=True, dataloader_pin_memory=False,
+            max_grad_norm=0., lr_scheduler_type='constant', seed=42)
+        trainer = env['CueWeightedTrainer'](
+            model=model, args=args, train_dataset=dataset, eval_dataset=dataset,
+            optimizers=(torch.optim.SGD(model.parameters(), lr=.1), None))
+        trainer.train()
+        assert np.isfinite(trainer.evaluate()['eval_loss'])
+        tables.append(model.table.detach().clone())
+    torch.testing.assert_close(tables[0], tables[1])
+
+
+def test_real_batched_generation_stops_at_answer_or_qwen_eos(env):
+    torch = pytest.importorskip('torch')
+    transformers = pytest.importorskip('transformers')
+    tokenizers = pytest.importorskip('tokenizers')
+    from functools import partial
+    from tqdm.auto import tqdm
+
+    special = ['<pad>', '<|im_end|>', '<|endoftext|>']
+    vocab = {text: i for i, text in enumerate(special + sorted(tokenizers.pre_tokenizers.ByteLevel.alphabet()))}
+    backend = tokenizers.Tokenizer(tokenizers.models.BPE(vocab, []))
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = tokenizers.decoders.ByteLevel()
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, pad_token='<pad>', eos_token='<|im_end|>',
+        additional_special_tokens=['<|endoftext|>'])
+    # No checkpoints or tokenizer files are downloaded: force tokens from a tiny random local model.
+    model = transformers.GPT2LMHeadModel(transformers.GPT2Config(
+        vocab_size=len(tokenizer), n_positions=128, n_embd=8, n_layer=1, n_head=1,
+        eos_token_id=vocab['<|endoftext|>'], pad_token_id=vocab['<pad>']))
+    emitted = ['<answer>low</answer>Human: continue',
+               '<answer>high (tense/bright)</answer>Human: continue',
+               '<answer>low<|im_end|>Human: continue',
+               '<answer>high<|endoftext|>Human: continue',
+               'x' * 60]
+    streams = [tokenizer.encode(text, add_special_tokens=False) for text in emitted]
+    prompt_length = len(tokenizer.encode('prompt', add_special_tokens=False))
+
+    class ForceTokens(transformers.LogitsProcessor):
+        def __call__(self, input_ids, scores):
+            step = input_ids.shape[1] - prompt_length
+            scores.fill_(-float('inf'))
+            for i, stream in enumerate(streams):
+                scores[i, stream[step] if step < len(stream) else vocab['<|im_end|>']] = 0
+            return scores
+
+    model.generate = partial(model.generate, logits_processor=[ForceTokens()])
+
+    class Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            return 'prompt'
+
+        def __call__(self, text, **kwargs):
+            return tokenizer(text, padding=True, return_tensors='pt', return_token_type_ids=False)
+
+    processor = Processor()
+    processor.tokenizer = tokenizer
+    env.update(torch=torch, tqdm=tqdm, load_audio=lambda path: np.zeros(16))
+    frame = pd.DataFrame([dict(audio_path='a.wav', effective_gender='F', instruction='cue?',
+                               cue='timbre' if i == 1 else 'pitch_level',
+                               truth='high (tense/bright)' if i == 1 else 'low') for i in range(5)])
+    records, _ = env['evaluate_generated'](model, processor, frame)
+    assert records.prediction.tolist() == ['low', 'high (tense/bright)', 'invalid', 'invalid', 'invalid']
+    assert records.hit_token_limit.tolist() == [False, False, False, False, True]
+    assert not records.completion.str.contains('Human').any()
+    assert '<|im_end|>' in records.raw_completion.iloc[2]
+    assert '<|endoftext|>' in records.raw_completion.iloc[3]
+    assert tokenizer.padding_side == 'right' and model.training
 
 
 def write_drive_export(root):
@@ -259,6 +445,7 @@ def test_reference_group_reaches_training_and_generation_prompts(env, gender):
                                pitch_level_cue='low', emotion='joy', speaker='private')])
     examples, _ = env['build_examples'](frame, ['pitch_level'])
     item = env['CueDataset'](examples)[0]
+    item['loss_weight'] = 1.25
     assert item['effective_gender'] == gender
     assert item['sft_gt'] == '<answer>low</answer>'
     instruction = item['instruction']
@@ -279,7 +466,8 @@ def test_reference_group_reaches_training_and_generation_prompts(env, gender):
             return dict(input_ids=tensor(ids), attention_mask=tensor(np.ones_like(ids)))
 
     env['load_audio'] = lambda path: np.zeros(16)
-    env['CueCollator'](Processor())([item])
+    batch = env['CueCollator'](Processor())([item])
+    assert batch['loss_weights'][0] == 1.25
     assert seen[0] == generation_messages
     assert seen[1][:-1] == generation_messages
     assert generation_messages[1]['content'][1]['text'] == instruction

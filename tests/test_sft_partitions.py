@@ -23,7 +23,7 @@ def env():
                  milp=milp, Bounds=Bounds, LinearConstraint=LinearConstraint,
                  csr_matrix=csr_matrix, eye=eye, hstack=hstack, vstack=vstack,
                  accuracy_score=accuracy_score, precision_recall_fscore_support=precision_recall_fscore_support,
-                 Dataset=object, display=lambda *args: None)
+                 Dataset=object, Trainer=object, display=lambda *args: None)
     constants = {'CUES', 'CUE_LABELS', 'EMOTIONS', 'PERSONA', 'PROMPT_VERSION', 'MODEL_ID', 'SEED'}
     for cell in json.loads(NOTEBOOK.read_text())['cells']:
         if cell['cell_type'] != 'code':

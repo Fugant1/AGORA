@@ -8,7 +8,6 @@ import pandas as pd
 import pytest
 
 from tests.test_sft_partitions import env, train, NOTEBOOK
-from tests.test_sft_v2 import tensor
 
 
 def test_teacher_gets_transcript_gender_and_targets_student_gets_only_gender(env, train):
@@ -84,23 +83,40 @@ def test_empty_or_structurally_invalid_teacher_response_fails(env, train):
 
 
 def test_collator_masks_gender_prompt_and_preserves_complete_target(env, train):
+    torch = pytest.importorskip('torch')
+    env['torch'] = torch
     row = train.iloc[0].to_dict()
     row['sft_gt'] = env['format_sft_target'](row, '1. A. 2. B. 3. C.')
+    weights = env['inverse_frequency_cue_weights'](train).set_index(['cue', 'label']).weight.to_dict()
     seen = []
+    class Tokenizer:
+        is_fast = True
+        def __call__(self, text, **kwargs):
+            return dict(input_ids=[ord(c) + 10 for c in text],
+                        offset_mapping=[(i, i + 1) for i in range(len(text))])
     class Processor:
+        tokenizer = Tokenizer()
         def apply_chat_template(self, messages, **kwargs):
             seen.append(messages)
             return 'full' if len(messages) == 3 else 'prompt'
         def __call__(self, text, **kwargs):
-            ids = [[1, 2, 3, 4, 0, 0]] if text == ['full'] else [[1, 2, 3]]
-            mask = [[1, 1, 1, 1, 1, 0]] if text == ['full'] else [[1, 1, 1]]
-            return dict(input_ids=tensor(ids), attention_mask=tensor(mask))
+            ids = [1, 2, 3]
+            if text == ['full']:
+                ids += self.tokenizer(row['sft_gt'])['input_ids'] + [0, 0]
+            mask = [1] * len(ids)
+            if text == ['full']:
+                mask[-1] = 0
+            return dict(input_ids=torch.tensor([ids]), attention_mask=torch.tensor([mask]))
     env['load_audio'] = lambda path: np.zeros(160)
-    batch = env['SERCollator'](Processor())([row])
+    batch = env['SERCollator'](Processor(), weights)([row])
     assert 'F (female)' in seen[0][1]['content'][1]['text']
     assert row['text'] not in str(seen[0])
     assert seen[1][-1]['content'] == row['sft_gt']
-    np.testing.assert_array_equal(batch['labels'], [[-100, -100, -100, 4, 0, -100]])
+    expected = [-100] * 3 + Processor.tokenizer(row['sft_gt'])['input_ids'] + [0, -100]
+    assert batch['labels'].tolist() == [expected]
+    assert batch['token_weights'][0, :3].tolist() == [0.] * 3
+    assert batch['token_weights'][0, -2:].tolist() == [1., 0.]
+    assert 'token_weights' not in seen[0][1]['content'][1]['text']
 
 
 def test_validation_scores_emotion_and_saved_cues_with_missing_targets(env, train, tmp_path):
