@@ -1,10 +1,12 @@
-"""Tests for data_processing.ipynb syntax, Run-All idempotency, and Section 10 batched WhisperX speech-rate tracking."""
+"""Tests for data_processing.ipynb syntax, Run-All idempotency, and Section 10 batched WhisperX + CMUdict/g2p_en speech-rate tracking."""
 import ast
 import json
 import math
 import shutil
-import time
+import sys
+import types
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -15,6 +17,31 @@ import soundfile as sf
 
 NOTEBOOK = Path(__file__).resolve().parents[1] / "data_processing.ipynb"
 
+# Authentic CMU Pronouncing Dictionary v0.7b ARPAbet entries for unit testing
+SAMPLE_CMUDICT: Dict[str, List[List[str]]] = {
+    "hello": [["HH", "AH0", "L", "OW1"], ["HH", "EH0", "L", "OW1"]],
+    "my": [["M", "AY1"]],
+    "people": [["P", "IY1", "P", "AH0", "L"]],
+    "didn't": [["D", "IH1", "D", "AH0", "N", "T"]],
+    "don't": [["D", "OW1", "N", "T"]],
+    "phoebe": [["F", "IY1", "B", "IY0"]],
+    "joey": [["JH", "OW1", "IY0"]],
+    "rachel": [["R", "EY1", "CH", "AH0", "L"]],
+    "okay": [["OW2", "K", "EY1"]],
+    "ok": [["OW2", "K", "EY1"]],
+    "you're": [["Y", "UH1", "R"]],
+    "no": [["N", "OW1"]],
+    "hey": [["HH", "EY1"]],
+    "how": [["HH", "AW1"]],
+    "are": [["AA1", "R"]],
+    "you": [["Y", "UW1"]],
+    "doing": [["D", "UW1", "IH0", "NG"]],
+    "today": [["T", "AH0", "D", "EY1"]],
+    "world": [["W", "ER1", "L", "D"]],
+    "friend": [["F", "R", "EH1", "N", "D"]],
+    "go": [["G", "OW1"]],
+}
+
 
 def _clean_source(cell_source: List[str]) -> str:
     return "".join(
@@ -22,19 +49,25 @@ def _clean_source(cell_source: List[str]) -> str:
     )
 
 
-def test_all_notebook_cells_parse_cleanly():
+def test_all_notebook_cells_parse_cleanly_and_have_no_ad_hoc_exception_tables():
     nb = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     code_cells = [c for c in nb["cells"] if c["cell_type"] == "code"]
     assert len(code_cells) >= 16
+    full_code = []
     for idx, cell in enumerate(code_cells):
         src = _clean_source(cell["source"])
         ast.parse(src, filename=f"data_processing.ipynb#code_cell_{idx}")
+        full_code.append(src)
+    combined = "\n".join(full_code)
+    assert "_SYLLABLE_EXCEPTIONS" not in combined
+    assert "_DIGIT_SYLLABLES" not in combined
+    assert "PhoneticSyllableCounter" in combined
+    assert "averaged_perceptron_tagger_eng" in combined
 
 
 @pytest.fixture
 def env(tmp_path):
-    """Load helper functions and constants from data_processing.ipynb without running top-level I/O."""
-    from dataclasses import dataclass
+    """Load helper functions and classes from data_processing.ipynb without running top-level I/O."""
     import gc
     import re
 
@@ -80,8 +113,6 @@ def env(tmp_path):
         "WHISPERX_RATE_CHECKPOINT_EVERY_BATCHES",
         "OVERWRITE_WHISPERX_RATE",
         "WHISPERX_RATE_COLUMNS",
-        "_SYLLABLE_EXCEPTIONS",
-        "_DIGIT_SYLLABLES",
     }
     for cell in nb["cells"]:
         if cell["cell_type"] != "code":
@@ -104,35 +135,51 @@ def env(tmp_path):
     return scope
 
 
-def test_count_word_syllables_conversational_english(env):
-    fn = env["count_word_syllables"]
-    assert fn("don't") == 1
-    assert fn("didn't") == 2
-    assert fn("couldn't") == 2
-    assert fn("you're") == 1
-    assert fn("y'know") == 2
-    assert fn("no-no") == 2
-    assert fn("little") == 2
-    assert fn("people") == 2
-    assert fn("walked") == 1
-    assert fn("wanted") == 2
-    assert fn("What?!") == 1
-    assert fn("...") == 0
-    assert fn("7") == 2
+def test_phonetic_syllable_counter_cmudict_and_g2p_fallback(env):
+    g2p_calls: List[str] = []
+
+    def fake_g2p(token: str) -> List[str]:
+        g2p_calls.append(token)
+        if token == "200":
+            return ["T", "UW1", " ", "HH", "AH1", "N", "D", "R", "AH0", "D"]  # 3 syllables
+        return ["G", "UW1", "F", "B", "AO2", "L"]  # 2 syllables
+
+    counter = env["PhoneticSyllableCounter"](cmu_dict=SAMPLE_CMUDICT, g2p_fn=fake_g2p)
+
+    # Primary CMUdict hits (never touch g2p_en)
+    assert counter.count_word("didn't") == 2
+    assert counter.count_word("don't") == 1
+    assert counter.count_word("people!") == 2
+    assert counter.count_word("Phoebe") == 2
+    assert counter.count_word("Joey") == 2
+    assert counter.count_word("OK") == 2
+    assert counter.count_word("no-no") == 2  # hyphenated compound decomposed into CMUdict parts
+    assert counter.count_word("...") == 0
+    assert g2p_calls == []
+
+    # OOV token & numeral trigger g2p_en fallback once and are memoized
+    assert counter.count_word("200") == 3
+    assert counter.count_word("200") == 3
+    assert counter.count_word("goofball") == 2
+    assert g2p_calls == ["200", "goofball"]
+    assert counter.cmu_hits == 7
+    assert counter.g2p_hits == 2
 
 
 def test_speech_rate_metrics_from_word_timestamps_and_pauses(env):
+    counter = env["PhoneticSyllableCounter"](cmu_dict=SAMPLE_CMUDICT, g2p_fn=lambda w: ["AH0"])
     fn = env["compute_speech_rate_metrics_from_words"]
+
     # 3 words across [0.10, 0.50], [0.80, 1.20], [1.50, 2.10] inside a 2.50s WAV
     # Active speech = 0.40 + 0.40 + 0.60 = 1.40s
     # Inter-word pauses = 0.30 + 0.30 = 0.60s
-    # Total spoken span (speech + pause) = 2.00s (ignores 0.10s leading & 0.40s trailing edge silence)
+    # Total spoken span (speech + pause) = 2.00s
     words = [
-        {"word": "Hello", "start": 0.10, "end": 0.50},   # 2 syl
-        {"word": "my", "start": 0.80, "end": 1.20},      # 1 syl
-        {"word": "people!", "start": 1.50, "end": 2.10}, # 2 syl
+        {"word": "Hello", "start": 0.10, "end": 0.50},   # 2 syl (CMUdict)
+        {"word": "my", "start": 0.80, "end": 1.20},      # 1 syl (CMUdict)
+        {"word": "people!", "start": 1.50, "end": 2.10}, # 2 syl (CMUdict)
     ]
-    res = fn(words, audio_duration=2.50, reference_text="Hello my people!")
+    res = fn(words, audio_duration=2.50, syllable_counter=counter, reference_text="Hello my people!")
     assert res["whisperx_word_count"] == 3
     assert res["whisperx_syllable_count"] == 5
     assert res["whisperx_speech_duration"] == pytest.approx(1.40, abs=1e-5)
@@ -142,7 +189,7 @@ def test_speech_rate_metrics_from_word_timestamps_and_pauses(env):
     assert res["whisperx_word_rate"] == pytest.approx(1.50, abs=1e-5)
 
     # Fallback when alignment returns no timestamped words
-    fb = fn([], audio_duration=2.0, reference_text="Okay don't go")
+    fb = fn([], audio_duration=2.0, syllable_counter=counter, reference_text="Okay don't go")
     assert fb["whisperx_word_count"] == 3
     assert fb["whisperx_syllable_count"] == 4
     assert fb["whisperx_utterance_span"] == pytest.approx(2.0)
@@ -151,7 +198,6 @@ def test_speech_rate_metrics_from_word_timestamps_and_pauses(env):
 
 def test_global_quartiles_are_gender_agnostic_25_50_25(env):
     classify = env["classify_global_quartiles"]
-    # 20 distinct positive values -> exact 25% low (5), 50% moderate (10), 25% high (5)
     vals = pd.Series(np.arange(1.0, 21.0))
     labels, stats = classify(vals)
     assert stats["count"] == 20
@@ -216,7 +262,6 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
     train_csv = clean_dir / "clean_train_set_with_cues.csv"
     orig_df.to_csv(train_csv, index=False)
 
-    # Track tqdm progress bar and WhisperX batch sizes
     bars = []
 
     class FakeTqdm:
@@ -240,7 +285,6 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
             self.postfixes.append(kwargs)
 
     env["tqdm"] = FakeTqdm
-
     asr_batch_sizes = []
 
     class FakeAsrModel:
@@ -251,7 +295,6 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
             assert self._use_interleaved_context is False
             assert self.previous_batch_context_tokens == [[]] * len(batch_inputs)
             asr_batch_sizes.append(len(batch_inputs))
-            # Return simple deterministic text whose length scales with clip duration/index
             return [{"text": f"hello world {'friend ' * (idx % 4)}".strip()} for idx, _ in enumerate(batch_inputs)]
 
     align_calls = []
@@ -268,17 +311,19 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
             words = []
             for k, tok in enumerate(tokens):
                 ws = t0 + k * step
-                we = ws + step * 0.7  # leaves a 0.3 * step inter-word pause between words!
+                we = ws + step * 0.7
                 words.append({"word": tok, "start": ws, "end": we})
             out_segs.append({"text": seg["text"], "start": t0, "end": t1, "words": words})
         return {"segments": out_segs, "word_segments": [w for s in out_segs for w in s["words"]]}
 
-    # 1. Verify save_local_pipeline_to_drive does NOT overwrite existing tar or existing Drive metadata
+    counter = env["PhoneticSyllableCounter"](cmu_dict=SAMPLE_CMUDICT, g2p_fn=lambda w: ["AH0"])
+
+    # 1. save_local_pipeline_to_drive never overwrites existing Drive tar or existing Drive metadata
     env["save_local_pipeline_to_drive"](local_dir=local_dir, drive_dir=drive_dir, overwrite=False)
     assert drive_tar.read_bytes() == b"existing-tar-bytes"
     assert drive_quartiles.read_text(encoding="utf-8") == '{"F": {}, "M": {}}'
 
-    # 2. Run batched WhisperX speech-rate tracking (16 audios/batch)
+    # 2. Run batched WhisperX + CMUdict speech-rate tracking (16 audios/batch)
     updated_df = env["add_whisperx_speech_rates_to_clean_train"](
         train_csv_path=train_csv,
         drive_dir=drive_dir,
@@ -289,6 +334,7 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
         align_metadata={"language": "en"},
         device="cpu",
         align_fn=fake_align,
+        syllable_counter=counter,
     )
 
     assert asr_batch_sizes == [16, 16, 3]
@@ -298,12 +344,10 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
     assert bars[0].updates == [16, 16, 3]
     assert bars[0].closed is True
 
-    # Verify all new columns exist and all original columns remain completely untouched
     for col in env["WHISPERX_RATE_COLUMNS"]:
         assert col in updated_df.columns
     pd.testing.assert_frame_equal(updated_df[orig_df.columns], orig_df)
 
-    # Verify pauses were genuinely tracked (> 0) and global quartiles contain low/moderate/high
     assert (updated_df["whisperx_pause_duration"] > 0.0).all()
     assert np.allclose(
         updated_df["whisperx_speech_duration"] + updated_df["whisperx_pause_duration"],
@@ -313,7 +357,6 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
     assert set(updated_df["whisperx_syllable_rate_cue"].unique()) == {"low", "moderate", "high"}
     assert set(updated_df["whisperx_word_rate_cue"].unique()) == {"low", "moderate", "high"}
 
-    # Verify Drive received ONLY the updated CSV and existing tar/quartiles were untouched
     drive_train_csv = drive_clean_dir / "clean_train_set_with_cues.csv"
     assert drive_train_csv.is_file()
     pd.testing.assert_frame_equal(pd.read_csv(drive_train_csv), pd.read_csv(train_csv))
@@ -322,7 +365,7 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
     assert val_file.read_text(encoding="utf-8") == "audio_path,emotion\na.wav,joy\n"
     assert not (clean_dir / "whisperx_rate_train.partial.csv").exists()
 
-    # 3. Re-running (simulating a second "Run All") skips cleanly with 0 WhisperX calls
+    # 3. Re-running skips completely with 0 WhisperX calls
     asr_batch_sizes.clear()
     align_calls.clear()
     second_df = env["add_whisperx_speech_rates_to_clean_train"](
@@ -335,6 +378,7 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
         align_metadata={"language": "en"},
         device="cpu",
         align_fn=fake_align,
+        syllable_counter=counter,
     )
     assert asr_batch_sizes == []
     assert align_calls == []
@@ -343,15 +387,11 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
 
 def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_rate(tmp_path, monkeypatch):
     """Simulate Colab 'Run All' on a pre-populated workspace where Stages 1-9 are already cached."""
-    import sys
-    import types
-
     local_dir = tmp_path / "agora_work" / "meld_16k_mono"
     clean_dir = local_dir / "emo_tag_clean"
     train_wav_dir = clean_dir / "train"
     train_wav_dir.mkdir(parents=True)
 
-    # Create 18 cleaned training clips + cached outputs from Stages 1-8 (NO MELD.tar and NO raw WAVs!)
     rows = []
     for i in range(18):
         dur = 1.2 + (i % 3) * 0.5
@@ -394,7 +434,6 @@ def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_r
     train_df.head(2).to_csv(clean_dir / "clean_val_set_with_cues.csv", index=False)
     (clean_dir / "gender_acoustic_quartiles.json").write_text('{"F": {}, "M": {}, "__GLOBAL__": {}}', encoding="utf-8")
 
-    # Mock torch and whisperx in sys.modules so Cell 31 runs end-to-end without GPU
     asr_batches = []
 
     class MockAsr:
@@ -406,6 +445,7 @@ def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_r
             return [{"text": "hey how are you doing today"} for _ in batch_inputs]
 
     mock_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None))
+    mock_cmudict = types.SimpleNamespace(dict=lambda: SAMPLE_CMUDICT)
     mock_whisperx = types.SimpleNamespace(
         load_model=lambda *a, **kw: MockAsr(),
         load_align_model=lambda *a, **kw: (object(), {"language": "en"}),
@@ -425,9 +465,9 @@ def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_r
         },
     )
     monkeypatch.setitem(sys.modules, "torch", mock_torch)
+    monkeypatch.setitem(sys.modules, "cmudict", mock_cmudict)
     monkeypatch.setitem(sys.modules, "whisperx", mock_whisperx)
 
-    # Execute every code cell of data_processing.ipynb in order (skipping !pip install)
     nb = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     ns: Dict[str, Any] = {}
     for cell in nb["cells"]:
@@ -436,7 +476,6 @@ def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_r
         src = _clean_source(cell["source"])
         if not src.strip():
             continue
-        # Redirect DATA_DIR / MELD_DIR / DRIVE_DATA_DIR right after Cell 5 sets them
         if cell.get("id") == "nTVctV94NJk1":
             src = src.replace(
                 'DATA_DIR = Path("/home/fuganti/Projects/OPERA/data/meld_16k_mono")',
@@ -447,13 +486,14 @@ def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_r
             )
         exec(compile(src, f"data_processing.ipynb#{cell.get('id')}", "exec"), ns)
 
-    # Verify Run All completed cleanly, processed ONLY the 18 clips in batches of [16, 2], and preserved all prior columns
     assert asr_batches == [16, 2]
     saved = pd.read_csv(clean_dir / "clean_train_set_with_cues.csv")
     assert len(saved) == 18
     for col in ns["WHISPERX_RATE_COLUMNS"]:
         assert col in saved.columns
+    # "hey how are you doing today" = 1+1+1+1+2+2 = 8 phonetic syllables in CMUdict
+    assert (saved["whisperx_syllable_count"] == 8).all()
+    assert (saved["whisperx_word_count"] == 6).all()
     assert saved["whisperx_syllable_rate_cue"].isin(["low", "moderate", "high"]).all()
     assert saved["whisperx_word_rate_cue"].isin(["low", "moderate", "high"]).all()
     assert (clean_dir / "gender_acoustic_quartiles.json").read_text(encoding="utf-8") == '{"F": {}, "M": {}, "__GLOBAL__": {}}'
-
