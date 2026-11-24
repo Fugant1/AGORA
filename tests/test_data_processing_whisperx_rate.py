@@ -112,12 +112,13 @@ def env(tmp_path):
         "WHISPERX_RATE_SILENCE_PAD_SEC",
         "WHISPERX_RATE_CHECKPOINT_EVERY_BATCHES",
         "OVERWRITE_WHISPERX_RATE",
+        "OVERWRITE_WHISPERX_RATE_VAL",
         "WHISPERX_RATE_COLUMNS",
     }
     for cell in nb["cells"]:
         if cell["cell_type"] != "code":
             continue
-        if cell.get("id") not in ("KYeTZExdNJk-", "YPuivv9SNJlC", "wxRateCode10"):
+        if cell.get("id") not in ("KYeTZExdNJk-", "YPuivv9SNJlC", "wxRateCode10", "wxRateValCode11"):
             continue
         tree = ast.parse(_clean_source(cell["source"]))
         nodes = []
@@ -385,12 +386,175 @@ def test_batched_16_whisperx_tracking_preserves_existing_data_and_skips_on_rerun
     pd.testing.assert_frame_equal(second_df, updated_df)
 
 
+def test_val_whisperx_uses_train_fitted_global_quartiles_without_leakage_and_skips_on_rerun(env, tmp_path):
+    local_dir = tmp_path / "local" / "meld_16k_mono"
+    clean_dir = local_dir / "emo_tag_clean"
+    val_wav_dir = clean_dir / "val"
+    drive_dir = tmp_path / "drive" / "meld_16k_mono"
+    drive_clean_dir = drive_dir / "emo_tag_clean"
+    val_wav_dir.mkdir(parents=True)
+    drive_clean_dir.mkdir(parents=True)
+
+    # Pre-existing train CSV with high global rates (Q25=10.75, Q75=18.25) and protected files
+    train_csv = clean_dir / "clean_train_set_with_cues.csv"
+    train_df = pd.DataFrame(
+        {
+            "audio_path": [f"/clean/train/dia{i}_utt0.wav" for i in range(20)],
+            "dialogue": list(range(20)),
+            "utterance": [0] * 20,
+            "whisperx_syllable_rate": np.linspace(8.0, 22.0, 20),
+            "whisperx_word_rate": np.linspace(4.0, 12.0, 20),
+            "whisperx_syllable_rate_cue": ["moderate"] * 20,
+            "whisperx_word_rate_cue": ["moderate"] * 20,
+        }
+    )
+    train_df.to_csv(train_csv, index=False)
+    train_bytes_before = train_csv.read_bytes()
+
+    quartiles_file = clean_dir / "gender_acoustic_quartiles.json"
+    quartiles_file.write_text('{"F": {}, "M": {}}', encoding="utf-8")
+    drive_tar = drive_dir / "meld_16k_mono_clean.tar"
+    drive_tar.write_bytes(b"existing-tar-bytes")
+
+    # Create 19 val WAVs (tests batches of [16, 3]) whose rates will all fall below train Q25 (~11.5 syl/s)
+    val_rows = []
+    for i in range(19):
+        dur = 2.0 + (i % 3) * 0.5
+        wav_path = val_wav_dir / f"dia{i}_utt0.wav"
+        sf.write(str(wav_path), np.zeros(int(round(dur * 16000)), dtype=np.float32), 16000, subtype="PCM_16")
+        val_rows.append(
+            {
+                "audio_path": f"/old/runtime/emo_tag_clean/val/{wav_path.name}",
+                "dialogue": i,
+                "utterance": 0,
+                "emotion": "neutral",
+                "text": "hello world",
+                "speaker": "Rachel" if i % 2 == 0 else "Ross",
+                "duration": dur,
+                "gender": "F" if i % 2 == 0 else "M",
+                "effective_gender": "F" if i % 2 == 0 else "M",
+                "speaking_rate": 3.0,
+                "speaking_rate_cue": "high",
+            }
+        )
+    orig_val = pd.DataFrame(val_rows)
+    val_csv = clean_dir / "clean_val_set_with_cues.csv"
+    orig_val.to_csv(val_csv, index=False)
+
+    bars = []
+
+    class FakeTqdm:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.updates = []
+            self.closed = False
+            bars.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.closed = True
+
+        def update(self, n):
+            self.updates.append(n)
+
+        def set_postfix(self, **kwargs):
+            pass
+
+    env["tqdm"] = FakeTqdm
+    asr_batches = []
+
+    class FakeAsrModel:
+        def __call__(self, batch_inputs, batch_size=16):
+            asr_batches.append(len(batch_inputs))
+            return [{"text": "hello world"} for _ in batch_inputs]
+
+    def fake_align(segments, align_model, align_metadata, audio, device, return_char_alignments=False):
+        out_segs = []
+        for seg in segments:
+            t0 = float(seg["start"])
+            t1 = float(seg["end"])
+            # 3 syllables ("hello"=2, "world"=1) across ~1.5s => ~2.0 syl/s (strictly < train Q25)
+            words = [
+                {"word": "hello", "start": t0 + 0.1, "end": t0 + 0.6},
+                {"word": "world", "start": t0 + 1.0, "end": t0 + 1.6},
+            ]
+            out_segs.append({"text": seg["text"], "start": t0, "end": t1, "words": words})
+        return {"segments": out_segs, "word_segments": [w for s in out_segs for w in s["words"]]}
+
+    counter = env["PhoneticSyllableCounter"](cmu_dict=SAMPLE_CMUDICT, g2p_fn=lambda w: ["AH0"])
+
+    # Missing WhisperX columns in train CSV must fail early
+    bad_train = tmp_path / "train_no_wx.csv"
+    pd.DataFrame([{"audio_path": "a.wav"}]).to_csv(bad_train, index=False)
+    with pytest.raises(ValueError, match="missing 'whisperx_syllable_rate'"):
+        env["add_whisperx_speech_rates_to_clean_val"](
+            val_csv_path=val_csv, train_csv_path=bad_train, drive_dir=drive_dir
+        )
+
+    updated_val = env["add_whisperx_speech_rates_to_clean_val"](
+        val_csv_path=val_csv,
+        train_csv_path=train_csv,
+        drive_dir=drive_dir,
+        batch_size=16,
+        overwrite=False,
+        asr_model=FakeAsrModel(),
+        align_model=object(),
+        align_metadata={"language": "en"},
+        device="cpu",
+        align_fn=fake_align,
+        syllable_counter=counter,
+    )
+
+    assert asr_batches == [16, 3]
+    assert bars[0].kwargs["total"] == 19
+    assert "{remaining}" in bars[0].kwargs["bar_format"]
+    assert bars[0].updates == [16, 3]
+    assert bars[0].closed is True
+    for col in env["WHISPERX_RATE_COLUMNS"]:
+        assert col in updated_val.columns
+    pd.testing.assert_frame_equal(updated_val[orig_val.columns], orig_val)
+
+    # Zero leakage check: all val rates (~2.0 syl/s, ~1.33 words/s) are below train Q25, so ALL must be "low"
+    assert (updated_val["whisperx_syllable_rate_cue"] == "low").all()
+    assert (updated_val["whisperx_word_rate_cue"] == "low").all()
+
+    drive_val_csv = drive_clean_dir / "clean_val_set_with_cues.csv"
+    assert drive_val_csv.is_file()
+    pd.testing.assert_frame_equal(pd.read_csv(drive_val_csv), pd.read_csv(val_csv))
+    assert train_csv.read_bytes() == train_bytes_before
+    assert drive_tar.read_bytes() == b"existing-tar-bytes"
+    assert quartiles_file.read_text(encoding="utf-8") == '{"F": {}, "M": {}}'
+    assert not (clean_dir / "whisperx_rate_val.partial.csv").exists()
+
+    # Re-run skips completely with 0 WhisperX calls
+    asr_batches.clear()
+    second_val = env["add_whisperx_speech_rates_to_clean_val"](
+        val_csv_path=val_csv,
+        train_csv_path=train_csv,
+        drive_dir=drive_dir,
+        batch_size=16,
+        overwrite=False,
+        asr_model=FakeAsrModel(),
+        align_model=object(),
+        align_metadata={"language": "en"},
+        device="cpu",
+        align_fn=fake_align,
+        syllable_counter=counter,
+    )
+    assert asr_batches == []
+    pd.testing.assert_frame_equal(second_val, updated_val)
+
+
 def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_rate(tmp_path, monkeypatch):
     """Simulate Colab 'Run All' on a pre-populated workspace where Stages 1-9 are already cached."""
     local_dir = tmp_path / "agora_work" / "meld_16k_mono"
     clean_dir = local_dir / "emo_tag_clean"
     train_wav_dir = clean_dir / "train"
+    val_wav_dir = clean_dir / "val"
     train_wav_dir.mkdir(parents=True)
+    val_wav_dir.mkdir(parents=True)
 
     rows = []
     for i in range(18):
@@ -426,12 +590,21 @@ def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_r
             }
         )
     train_df = pd.DataFrame(rows)
+    val_rows = []
+    for i in range(4):
+        dur = 1.5
+        wav_path = val_wav_dir / f"dia{i}_utt0.wav"
+        sf.write(str(wav_path), np.zeros(int(round(dur * 16000)), dtype=np.float32), 16000, subtype="PCM_16")
+        val_row = dict(rows[i], audio_path=str(wav_path), duration=dur)
+        val_rows.append(val_row)
+    val_df = pd.DataFrame(val_rows)
+
     train_df.to_csv(clean_dir / "clean_train_set.csv", index=False)
     train_df.to_csv(clean_dir / "train_egemaps.csv", index=False)
     train_df.to_csv(clean_dir / "clean_train_set_with_cues.csv", index=False)
-    train_df.head(2).to_csv(clean_dir / "clean_val_set.csv", index=False)
-    train_df.head(2).to_csv(clean_dir / "val_egemaps.csv", index=False)
-    train_df.head(2).to_csv(clean_dir / "clean_val_set_with_cues.csv", index=False)
+    val_df.to_csv(clean_dir / "clean_val_set.csv", index=False)
+    val_df.to_csv(clean_dir / "val_egemaps.csv", index=False)
+    val_df.to_csv(clean_dir / "clean_val_set_with_cues.csv", index=False)
     (clean_dir / "gender_acoustic_quartiles.json").write_text('{"F": {}, "M": {}, "__GLOBAL__": {}}', encoding="utf-8")
 
     asr_batches = []
@@ -486,14 +659,17 @@ def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_r
             )
         exec(compile(src, f"data_processing.ipynb#{cell.get('id')}", "exec"), ns)
 
-    assert asr_batches == [16, 2]
-    saved = pd.read_csv(clean_dir / "clean_train_set_with_cues.csv")
-    assert len(saved) == 18
-    for col in ns["WHISPERX_RATE_COLUMNS"]:
-        assert col in saved.columns
-    # "hey how are you doing today" = 1+1+1+1+2+2 = 8 phonetic syllables in CMUdict
-    assert (saved["whisperx_syllable_count"] == 8).all()
-    assert (saved["whisperx_word_count"] == 6).all()
-    assert saved["whisperx_syllable_rate_cue"].isin(["low", "moderate", "high"]).all()
-    assert saved["whisperx_word_rate_cue"].isin(["low", "moderate", "high"]).all()
+    assert asr_batches == [16, 2, 4]
+    saved_train = pd.read_csv(clean_dir / "clean_train_set_with_cues.csv")
+    saved_val = pd.read_csv(clean_dir / "clean_val_set_with_cues.csv")
+    assert len(saved_train) == 18
+    assert len(saved_val) == 4
+    for frame in (saved_train, saved_val):
+        for col in ns["WHISPERX_RATE_COLUMNS"]:
+            assert col in frame.columns
+        # "hey how are you doing today" = 1+1+1+1+2+2 = 8 phonetic syllables in CMUdict
+        assert (frame["whisperx_syllable_count"] == 8).all()
+        assert (frame["whisperx_word_count"] == 6).all()
+        assert frame["whisperx_syllable_rate_cue"].isin(["low", "moderate", "high"]).all()
+        assert frame["whisperx_word_rate_cue"].isin(["low", "moderate", "high"]).all()
     assert (clean_dir / "gender_acoustic_quartiles.json").read_text(encoding="utf-8") == '{"F": {}, "M": {}, "__GLOBAL__": {}}'

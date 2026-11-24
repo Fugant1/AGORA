@@ -22,7 +22,7 @@ def env():
                  Dataset=object, Trainer=object,
                  torch=SimpleNamespace(inference_mode=nullcontext, float32=np.float32,
                                        tensor=lambda value, dtype=None: tensor(value)))
-    constants = {'CUES', 'CUE_LABELS', 'CUE_DESCRIPTIONS', 'PERSONA'}
+    constants = {'CUES', 'CUE_COLUMNS', 'GLOBAL_CUES', 'CUE_LABELS', 'CUE_DESCRIPTIONS', 'PERSONA'}
     for cell in json.loads(NOTEBOOK.read_text())['cells']:
         if cell['cell_type'] != 'code':
             continue
@@ -45,7 +45,8 @@ def test_manifests_rebase_without_resplitting_and_preserve_labels(env, tmp_path)
         audio.touch()
         rows.append(dict(audio_path=f'/old/ssd/meld/emo_tag_clean/val/{audio.name}',
                          effective_gender=['F', 'M', '__GLOBAL__'][i],
-                         **{f'{c}_cue': env['CUE_LABELS'][c][i] for c in env['CUES']}))
+                         speaking_rate_cue='low',
+                         **{env['CUE_COLUMNS'][c]: env['CUE_LABELS'][c][i] for c in env['CUES']}))
     rows[0]['pitch_level_cue'] = None
     csv = tmp_path / 'val.csv'
     pd.DataFrame(rows).to_csv(csv, index=False)
@@ -69,7 +70,8 @@ def test_missing_training_labels_and_unknown_labels_fail(env, tmp_path):
     path = tmp_path / 'emo_tag_clean/train/a.wav'
     path.parent.mkdir(parents=True)
     path.touch()
-    row = dict(audio_path=str(path), effective_gender='F', **{f'{c}_cue': env['CUE_LABELS'][c][0] for c in env['CUES']})
+    row = dict(audio_path=str(path), effective_gender='F',
+               **{env['CUE_COLUMNS'][c]: env['CUE_LABELS'][c][0] for c in env['CUES']})
     csv = tmp_path / 'train.csv'
     for value, error in [(None, 'missing training'), ('elevated', 'unknown')]:
         row['pitch_level_cue'] = value
@@ -476,12 +478,47 @@ def test_reference_group_reaches_training_and_generation_prompts(env, gender):
 @pytest.mark.parametrize('gender', [None, 'unknown', 'female'])
 def test_manifest_rejects_missing_or_unknown_reference_group(env, tmp_path, gender):
     row = dict(audio_path='val/a.wav', effective_gender=gender,
-               **{f'{cue}_cue': env['CUE_LABELS'][cue][0] for cue in env['CUES']})
+               **{env['CUE_COLUMNS'][cue]: env['CUE_LABELS'][cue][0] for cue in env['CUES']})
     csv = tmp_path / 'val.csv'
     pd.DataFrame([row]).to_csv(csv, index=False)
     with pytest.raises(ValueError, match='effective_gender'):
         env['load_manifest'](csv, 'val', tmp_path)
     pd.DataFrame([row]).drop(columns='effective_gender').to_csv(csv, index=False)
+    with pytest.raises(ValueError, match='missing columns'):
+        env['load_manifest'](csv, 'val', tmp_path)
+
+
+def test_speaking_rate_uses_whisperx_syllable_rate_cue_and_global_prompt(env, tmp_path):
+    assert env['CUE_COLUMNS']['speaking_rate'] == 'whisperx_syllable_rate_cue'
+    assert 'speaking_rate' in env['GLOBAL_CUES']
+    audio = tmp_path / 'emo_tag_clean/val/a.wav'
+    audio.parent.mkdir(parents=True)
+    audio.touch()
+    # Deliberately set legacy speaking_rate_cue='low' while whisperx_syllable_rate_cue='high'
+    row = dict(
+        audio_path=str(audio),
+        effective_gender='F',
+        speaking_rate_cue='low',
+        **{env['CUE_COLUMNS'][c]: 'high' if c == 'speaking_rate' else env['CUE_LABELS'][c][0] for c in env['CUES']},
+    )
+    csv = tmp_path / 'val.csv'
+    pd.DataFrame([row]).to_csv(csv, index=False)
+    frame = env['load_manifest'](csv, 'val', tmp_path)
+    examples, _ = env['build_examples'](frame, ['speaking_rate'])
+    assert len(examples) == 1
+    assert examples.loc[0, 'cue'] == 'speaking_rate'
+    assert examples.loc[0, 'truth'] == 'high'
+    assert examples.loc[0, 'sft_gt'] == '<answer>high</answer>'
+    instr_f = env['cue_instruction']('speaking_rate', 'F')
+    instr_m = env['cue_instruction']('speaking_rate', 'M')
+    instr_g = env['cue_instruction']('speaking_rate', '__GLOBAL__')
+    assert instr_f == instr_m == instr_g
+    assert 'global (all speakers, gender-agnostic)' in instr_f
+    assert 'syllables per second, including pauses' in instr_f
+    assert 'F (female)' not in instr_f
+    assert 'F (female)' in env['cue_instruction']('pitch_level', 'F')
+    # Missing whisperx_syllable_rate_cue must fail even when legacy speaking_rate_cue is present
+    pd.DataFrame([row]).drop(columns=['whisperx_syllable_rate_cue']).to_csv(csv, index=False)
     with pytest.raises(ValueError, match='missing columns'):
         env['load_manifest'](csv, 'val', tmp_path)
 

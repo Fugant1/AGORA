@@ -15,8 +15,10 @@ def test_weights_use_each_cues_own_sft_counts(env, train):
     frame = train.head(8).copy()
     for cue in env['CUES']:
         low, mid, high = env['CUE_LABELS'][cue]
-        frame[f'{cue}_cue'] = [low] * 2 + [mid] * 4 + [high] * 2
+        frame[env['CUE_COLUMNS'][cue]] = [low] * 2 + [mid] * 4 + [high] * 2
     frame['timbre_cue'] = [env['CUE_LABELS']['timbre'][i] for i in [0, 1, 1, 2, 2, 2, 2, 2]]
+    # Legacy openSMILE speaking_rate_cue is deliberately skewed and must be ignored
+    frame['speaking_rate_cue'] = ['moderate'] * 8
     weights = env['inverse_frequency_cue_weights'](frame)
     lookup = weights.set_index(['cue', 'label']).weight
     assert lookup['pitch_level', 'low'] == pytest.approx(4 / 3)
@@ -53,7 +55,7 @@ def test_only_inventory_values_are_weighted_including_subwords_and_leading_space
         expected = 1.
         for cue, (a, b) in spans.items():
             if start < b and end > a:
-                expected = lookup[cue, row[f'{cue}_cue']]
+                expected = lookup[cue, row[env['CUE_COLUMNS'][cue]]]
         assert weight == expected
         if start >= inventory_end:
             assert weight == 1.  # Repeated cue words in reasoning and final emotion stay unweighted.

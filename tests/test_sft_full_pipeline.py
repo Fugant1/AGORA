@@ -17,15 +17,20 @@ def test_teacher_gets_transcript_gender_and_targets_student_gets_only_gender(env
     assert 'F (female)' in teacher and 'F (female)' in student
     assert row['text'] in teacher and row['text'] not in student
     assert f"Target emotion: {row['emotion']}" in teacher and 'Target emotion:' not in student
-    assert '3 numbered steps' in teacher
-    assert 'exactly 3 short numbered sentences' in teacher and '90 words' in teacher
+    assert '3-4 sentences' in teacher and '90 words' in teacher
     assert '90 words' not in env['build_bridge_generation_prompt'](row, concise=False)
     assert f"- timbre: {row['timbre_cue']}" in teacher
-    row.update(effective_gender='__GLOBAL__', text='UNTRUSTED', emotion='joy', pitch_level_cue='high')
+    # speaking_rate stays named speaking_rate in inventory/prompts but is backed by whisperx_syllable_rate_cue
+    assert f"- speaking_rate: {row['whisperx_syllable_rate_cue']}" in teacher
+    assert f"- speaking_rate: {row['speaking_rate_cue']}" not in teacher
+    assert 'speaking_rate (syllables per second, including pauses) globally across all speakers' in student
+    assert 'global syllable rate (including pauses) across all speakers' in teacher
+    row.update(effective_gender='__GLOBAL__', text='UNTRUSTED', emotion='joy', pitch_level_cue='high',
+               whisperx_syllable_rate_cue='high')
     prompt = env['student_instruction'](row)
     assert 'pooled reference' in prompt and 'UNTRUSTED' not in prompt
     # All allowed classes occur in instructions, but no row's ground truth affects student input.
-    row.update(text='CHANGED', emotion='anger', pitch_level_cue='low')
+    row.update(text='CHANGED', emotion='anger', pitch_level_cue='low', whisperx_syllable_rate_cue='low')
     assert env['student_instruction'](row) == prompt
 
 
@@ -67,7 +72,7 @@ def test_teacher_checkpoint_reuses_targets_and_resumes_pending_rows(env, train, 
     for _, row in result.iterrows():
         emotion, cues = env['parse_completion'](row.sft_gt)
         assert emotion == row.emotion
-        assert all(cues[cue] == row[f'{cue}_cue'] for cue in env['CUES'])
+        assert all(cues[cue] == row[env['CUE_COLUMNS'][cue]] for cue in env['CUES'])
     resumed.clear()
     env['generate_sft_train'](None, None, result, path)
     assert not resumed
@@ -133,6 +138,7 @@ def test_validation_scores_emotion_and_saved_cues_with_missing_targets(env, trai
     assert report['cues']['pitch_level']['n'] == 1
     assert report['cues']['pitch_level']['missing_targets'] == 1
     assert report['cues']['pitch_level']['accuracy'] == 1
+    assert report['cues']['speaking_rate']['accuracy'] == .5
     assert report['cues']['timbre']['accuracy'] == .5
     assert (tmp_path/'after_validation_predictions.csv').exists()
     summary = pd.read_csv(tmp_path/'after_emotion_by_gender.csv')

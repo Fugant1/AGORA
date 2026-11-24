@@ -24,7 +24,7 @@ def env():
                  csr_matrix=csr_matrix, eye=eye, hstack=hstack, vstack=vstack,
                  accuracy_score=accuracy_score, precision_recall_fscore_support=precision_recall_fscore_support,
                  Dataset=object, Trainer=object, display=lambda *args: None)
-    constants = {'CUES', 'CUE_LABELS', 'EMOTIONS', 'PERSONA', 'PROMPT_VERSION', 'MODEL_ID', 'SEED'}
+    constants = {'CUES', 'CUE_COLUMNS', 'GLOBAL_CUES', 'CUE_LABELS', 'EMOTIONS', 'PERSONA', 'PROMPT_VERSION', 'MODEL_ID', 'SEED'}
     for cell in json.loads(NOTEBOOK.read_text())['cells']:
         if cell['cell_type'] != 'code':
             continue
@@ -57,7 +57,9 @@ def train(env):
                            raw_audio_path=f'/raw/{len(rows)}.wav', measured_feature=1.2345,
                            laughter_intervals_removed=i % 2)
                 for cue in env['CUES']:
-                    row[f'{cue}_cue'] = rng.choice(env['CUE_LABELS'][cue], p=[.2, .6, .2])
+                    row[env['CUE_COLUMNS'][cue]] = rng.choice(env['CUE_LABELS'][cue], p=[.2, .6, .2])
+                # Legacy openSMILE speaking_rate_cue intentionally differs from whisperx_syllable_rate_cue
+                row['speaking_rate_cue'] = 'low' if row['whisperx_syllable_rate_cue'] != 'low' else 'high'
                 rows.append(row)
     return pd.DataFrame(rows)
 
@@ -81,13 +83,15 @@ def test_cue_imbalance_matches_reference_when_feasible(env, train):
     for _, group in pool.groupby(['emotion', 'effective_gender']):
         for cue in env['CUES']:
             labels = env['CUE_LABELS'][cue]
-            pool.loc[group.index, f'{cue}_cue'] = [labels[0]] * 3 + [labels[1]] * 9 + [labels[2]] * 3
+            pool.loc[group.index, env['CUE_COLUMNS'][cue]] = [labels[0]] * 3 + [labels[1]] * 9 + [labels[2]] * 3
     selected, fit = env['select_cue_stratified'](pool, 5, pool, 42)
     assert fit['absolute_cue_count_deviation'] == pytest.approx(0)
     for gender in ('F', 'M'):
         for cue in env['CUES']:
-            counts = selected.loc[selected.effective_gender == gender, f'{cue}_cue'].value_counts()
+            counts = selected.loc[selected.effective_gender == gender, env['CUE_COLUMNS'][cue]].value_counts()
             assert counts[env['CUE_LABELS'][cue][1]] == 21  # 60%, not uniform thirds
+    audit = env['distribution_audit'](dict(pool=pool, selected=selected))
+    assert set(audit.loc[audit.variable == 'speaking_rate', 'column']) == {'whisperx_syllable_rate_cue'}
 
 
 def test_small_stratum_fails_instead_of_duplicating_or_relaxing(env, train):
