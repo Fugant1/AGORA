@@ -305,6 +305,15 @@ def test_timbre_ordinal_distance_payoff_and_missing_gt_handling():
         "vocal_energy": {"low": 0.25, "moderate": 0.50, "high": 0.25},
         "timbre": {"low (muffled/soft)": 0.25, "moderate (modal)": 0.50, "high (tense/bright)": 0.25},
     }
+    # Default inverse_frequency R2: valid wrong and invalid predictions BOTH score 0.0 (closes invalid-competitor loophole)
+    raw_wrong, _, hit_wrong = env["score_cue_payoff"]("high", "moderate", "speaking_rate", priors)
+    raw_invalid, _, hit_inv = env["score_cue_payoff"]("high", None, "speaking_rate", priors)
+    raw_hit_high, _, _ = env["score_cue_payoff"]("high", "high", "speaking_rate", priors)
+    raw_hit_mod, _, _ = env["score_cue_payoff"]("moderate", "moderate", "speaking_rate", priors)
+    assert raw_wrong == 0.0 and raw_invalid == 0.0 and hit_wrong == 0.0 and hit_inv == 0.0
+    assert raw_hit_high == pytest.approx(2.0 * raw_hit_mod)  # 2x larger UAR gradient on minority 25% vs 50%
+
+    # Distance-based ablation check (explicit flag)
     m = env["distance_based_payoff_matrix"](priors["timbre"], env["CUE_LABELS"]["timbre"])
     low_l, mod_l, high_l = env["CUE_LABELS"]["timbre"]
     assert m[low_l][low_l] > m[low_l][mod_l] > m[low_l][high_l]
@@ -457,15 +466,30 @@ def test_trainer_and_model_config_safety():
     assert "thinker_max_new_tokens" not in full_code
     assert "TOP_6_SPEAKERS" not in full_code
 
-    # 1 epoch, G=8, beta=0.0, hybrid split flags, no max_steps cap, no before-training validation
+    # 1 epoch, G=8, beta=0.0, stabilized batch/LR, parameter-free inverse-frequency R2, hybrid split flags
     cfg_cell = cell_containing(nb, "NUM_TRAIN_EPOCHS =")
     assert "NUM_TRAIN_EPOCHS = 1" in cfg_cell
     assert "NUM_GENERATIONS = 8" in cfg_cell
+    assert "STEPS_PER_GENERATION = 16" in cfg_cell
+    assert "GRADIENT_ACCUMULATION_STEPS = 32" in cfg_cell
+    assert "LEARNING_RATE = 1e-5" in cfg_cell
+    assert "WARMUP_STEPS = 5" in cfg_cell
+    assert "LR_SCHEDULER_TYPE = 'cosine'" in cfg_cell
     assert "BETA = 0.0" in cfg_cell
     assert "RESUME_CHECKPOINT_DIR: Optional[str] = None" in cfg_cell
 
+    flags_cell = cell_containing(nb, "USE_DISTANCE_BASED_PAYOFF =")
+    assert "USE_ZERO_MEAN = False" in flags_cell
+    assert "USE_MAP = False" in flags_cell
+    assert "USE_INVERSE_FREQUENCY = True" in flags_cell
+    assert "USE_DISTANCE_BASED_PAYOFF = False" in flags_cell
+
     init_cell = cell_containing(nb, "training_args = GRPOConfig(")
     assert "num_train_epochs=NUM_TRAIN_EPOCHS" in init_cell
+    assert "steps_per_generation=STEPS_PER_GENERATION" in init_cell
+    assert "generation_batch_size=" not in init_cell  # mutually exclusive with steps_per_generation in TRL
+    assert "lr_scheduler_type=LR_SCHEDULER_TYPE" in init_cell
+    assert "warmup_steps=WARMUP_STEPS" in init_cell
     assert "beta=BETA" in init_cell
     assert "max_steps=" not in init_cell
     assert "USE_SPLIT_ADVANTAGE = True" in init_cell
