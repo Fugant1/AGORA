@@ -470,8 +470,11 @@ def test_trainer_and_model_config_safety():
     cfg_cell = cell_containing(nb, "NUM_TRAIN_EPOCHS =")
     assert "NUM_TRAIN_EPOCHS = 1" in cfg_cell
     assert "NUM_GENERATIONS = 8" in cfg_cell
-    assert "STEPS_PER_GENERATION = 16" in cfg_cell
-    assert "GRADIENT_ACCUMULATION_STEPS = 32" in cfg_cell
+    assert "PER_DEVICE_TRAIN_BATCH_SIZE = 2" in cfg_cell
+    assert "STEPS_PER_GENERATION = 8" in cfg_cell
+    assert "GRADIENT_ACCUMULATION_STEPS = 16" in cfg_cell
+    assert "MAX_COMPLETION_LENGTH = 256" in cfg_cell
+    assert "EVAL_MAX_NEW_TOKENS = 512" in cfg_cell
     assert "LEARNING_RATE = 1e-5" in cfg_cell
     assert "WARMUP_STEPS = 5" in cfg_cell
     assert "LR_SCHEDULER_TYPE = 'cosine'" in cfg_cell
@@ -496,8 +499,10 @@ def test_trainer_and_model_config_safety():
     assert "USE_SPLIT_R2 = True" in init_cell
     assert "LOSS_TYPE = 'hybrid'" in init_cell
 
-    # Mid-train metrics logged to trainer.state.log_history
+    # Mid-train metrics logged to trainer.state.log_history + fast beta==0 reference skip merged
     trainer_cell = cell_containing(nb, "class AudioGRPOTrainer(")
+    assert "if self.args.beta != 0.0:" in trainer_cell
+    assert "fast_compute_loss" not in "\n".join(code_cells(nb))
     for metric_key in (
         "reward/R1_accuracy",
         "reward/R2_acoustic",
