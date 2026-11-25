@@ -16,15 +16,15 @@ def test_teacher_gets_transcript_gender_and_targets_student_gets_only_gender(env
     student = env['messages_for'](row)[1]['content'][1]['text']
     assert 'F (female)' in teacher and 'F (female)' in student
     assert row['text'] in teacher and row['text'] not in student
-    assert f"Target emotion: {row['emotion']}" in teacher and 'Target emotion:' not in student
+    assert f"\nEmotion: {row['emotion']}\n" in teacher and 'Emotion:' not in student
     assert '3-4 sentences' in teacher and '90 words' in teacher
     assert '90 words' not in env['build_bridge_generation_prompt'](row, concise=False)
     assert f"- timbre: {row['timbre_cue']}" in teacher
     # speaking_rate stays named speaking_rate in inventory/prompts but is backed by whisperx_syllable_rate_cue
     assert f"- speaking_rate: {row['whisperx_syllable_rate_cue']}" in teacher
     assert f"- speaking_rate: {row['speaking_rate_cue']}" not in teacher
-    assert 'speaking_rate (syllables per second, including pauses) globally across all speakers' in student
-    assert 'global syllable rate (including pauses) across all speakers' in teacher
+    assert 'Classify each acoustic cue relative to the supplied reference group.' in student
+    assert '\\Emotion:' not in teacher
     row.update(effective_gender='__GLOBAL__', text='UNTRUSTED', emotion='joy', pitch_level_cue='high',
                whisperx_syllable_rate_cue='high')
     prompt = env['student_instruction'](row)
@@ -64,7 +64,7 @@ def test_teacher_checkpoint_reuses_targets_and_resumes_pending_rows(env, train, 
                load_or_create_partitions=lambda *args: (pd.read_csv(path), pd.DataFrame(), {}),
                validate_partitions=lambda *args: None)
     cell = next(c for c in json.loads(NOTEBOOK.read_text())['cells']
-                if c['id'] == 'ser-sft-15')
+                if c.get('id') == 'ser-sft-15')
     exec(''.join(cell['source']), env)
     result = env['sft_train']
     assert resumed == [frame.iloc[2].audio_path]

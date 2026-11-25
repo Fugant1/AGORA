@@ -208,4 +208,4 @@ def test_run_exports_train_only_counts_and_weighting_metadata(env, train, tmp_pa
     assert manifest['loss']['weights_source'] == 'sft_train_only'
     assert manifest['loss']['weighted_spans'] == 'inventory_values_only'
     assert manifest['loss']['other_assistant_token_weight'] == 1.
-    assert len(manifest['loss']['weights']) == 15
+    assert len(manifest['loss']['weights']) == len(env['CUES']) * 3
