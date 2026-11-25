@@ -1,4 +1,4 @@
-# OPERA / AGORA: Acoustic-Grounded Omni Reasoning for Affect
+# AGORA: Acoustic-Grounded Omni Reasoning for Affect
 
 **Acoustically Grounded Speech Emotion Recognition on `Qwen2.5-Omni-7B` via Hybrid Cue-Split GRPO**
 
@@ -11,7 +11,7 @@
 
 Large omni-modal language models frequently rely on lexical shortcuts or emit unfaithful prosodic explanations when performing Speech Emotion Recognition (SER)—claiming pitch, loudness, or voice-quality patterns that contradict the physical speech signal or misreading lower-register male speech as neutral.
 
-**OPERA** trains `Qwen/Qwen2.5-Omni-7B` (`Qwen2_5OmniThinkerForConditionalGeneration`, 4-bit NF4 QLoRA) through an end-to-end **Jupyter Notebook pipeline** combining:
+**AGORA** trains `Qwen/Qwen2.5-Omni-7B` (`Qwen2_5OmniThinkerForConditionalGeneration`, 4-bit NF4 QLoRA) through an end-to-end **Jupyter Notebook pipeline** combining:
 1. **Laughter-cleaned, gender-normalized physical acoustic labeling** (**EMO-TAG** + **WhisperX** + **openSMILE `eGeMAPSv02`**),
 2. **Disjoint MILP-balanced Supervised Fine-Tuning (SFT)** with teacher-grounded prosodic reasoning, and
 3. **Hybrid Cue-Split Group Relative Policy Optimization (RLVR / GRPO)** that assigns local, mean-centered physical acoustic rewards directly to each generated cue value token while optimizing standardized emotion advantages on downstream reasoning and classification tokens.
@@ -135,11 +135,11 @@ The notebook reward math, strict parsers, MILP partition invariants, WhisperX sy
 ## Citation
 
 ```bibtex
-@misc{opera2026,
-  title={OPERA: Acoustic-Grounded Omni Reasoning for Speech Emotion Recognition via Hybrid Cue-Split GRPO},
+@misc{agora2026,
+  title={AGORA: Acoustic-Grounded Omni Reasoning for Speech Emotion Recognition via Hybrid Cue-Split GRPO},
   author={Fuganti et al.},
   year={2026},
   publisher={GitHub},
-  howpublished={\url{https://github.com/Fugant1/OPERA}}
+  howpublished={\url{https://github.com/Fugant1/AGORA}}
 }
 ```
