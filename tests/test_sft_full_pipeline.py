@@ -25,6 +25,10 @@ def test_teacher_gets_transcript_gender_and_targets_student_gets_only_gender(env
     assert f"- speaking_rate: {row['speaking_rate_cue']}" not in teacher
     assert 'Classify each acoustic cue relative to the supplied reference group.' in student
     assert '\\Emotion:' not in teacher
+    # speaking_rate must appear first in both student options and teacher [Acoustic Inventory]
+    assert env['CUES'][0] == 'speaking_rate'
+    assert '[Acoustic Inventory]\n- speaking_rate: ' in student
+    assert '[Acoustic Inventory]\n- speaking_rate: ' in teacher
     row.update(effective_gender='__GLOBAL__', text='UNTRUSTED', emotion='joy', pitch_level_cue='high',
                whisperx_syllable_rate_cue='high')
     prompt = env['student_instruction'](row)
@@ -125,25 +129,39 @@ def test_collator_masks_gender_prompt_and_preserves_complete_target(env, train):
 
 
 def test_validation_scores_emotion_and_saved_cues_with_missing_targets(env, train, tmp_path):
-    frame = train.head(2).copy()
-    frame.loc[frame.index[1], 'pitch_level_cue'] = None
-    outputs = [env['format_sft_target'](frame.iloc[0], '1. A. 2. B. 3. C.'), 'invalid response']
+    assert env['EVAL_BATCH_SIZE'] == 8
+    frame = train.head(5).copy().reset_index(drop=True)
+    frame.loc[1, 'pitch_level_cue'] = None
+    outputs = [
+        env['format_sft_target'](frame.iloc[0], '1. A. 2. B. 3. C.'),
+        'invalid response',
+        env['format_sft_target'](frame.iloc[2], '1. A. 2. B. 3. C.'),
+        env['format_sft_target'](frame.iloc[3], '1. A. 2. B. 3. C.'),
+        env['format_sft_target'](frame.iloc[4], '1. A. 2. B. 3. C.'),
+    ]
+    seen_batches = []
+    cursor = [0]
     def generate(model, processor, rows, teacher=False):
         assert not teacher
-        assert len(rows) == 2
-        return outputs
-    env.update(generate_completions=generate, GENERATION_BATCH_SIZE=2)
-    report = env['evaluate_validation'](None, None, frame, 'after', tmp_path)
-    assert report['emotion']['n'] == 2 and report['emotion']['accuracy'] == .5
-    assert report['cues']['pitch_level']['n'] == 1
+        seen_batches.append(len(rows))
+        batch_out = outputs[cursor[0]:cursor[0] + len(rows)]
+        cursor[0] += len(rows)
+        return batch_out
+    env.update(generate_completions=generate)
+    with pytest.raises(ValueError, match='batch_size'):
+        env['evaluate_validation'](None, None, frame, 'after', tmp_path, batch_size=0)
+    report = env['evaluate_validation'](None, None, frame, 'after', tmp_path, batch_size=2)
+    assert seen_batches == [2, 2, 1]
+    assert report['emotion']['n'] == 5 and report['emotion']['accuracy'] == pytest.approx(0.8)
+    assert report['cues']['pitch_level']['n'] == 4
     assert report['cues']['pitch_level']['missing_targets'] == 1
     assert report['cues']['pitch_level']['accuracy'] == 1
-    assert report['cues']['speaking_rate']['accuracy'] == .5
-    assert report['cues']['timbre']['accuracy'] == .5
+    assert report['cues']['speaking_rate']['accuracy'] == pytest.approx(0.8)
+    assert report['cues']['timbre']['accuracy'] == pytest.approx(0.8)
     assert (tmp_path/'after_validation_predictions.csv').exists()
     summary = pd.read_csv(tmp_path/'after_emotion_by_gender.csv')
-    assert summary.set_index('gender').loc['F', 'accuracy'] == .5
-    assert report['emotion_by_gender']['groups']['F']['n'] == 2
+    assert summary.set_index('gender').loc['F', 'accuracy'] == pytest.approx(0.8)
+    assert report['emotion_by_gender']['groups']['F']['n'] == 5
     saved = json.loads((tmp_path/'after_validation_metrics.json').read_text())
     assert saved['emotion_by_gender'] == report['emotion_by_gender']
     for text in [outputs[0] + '<answer>joy</answer>', '<answer>garbage</answer>']:

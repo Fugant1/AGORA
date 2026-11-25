@@ -12,6 +12,7 @@ from tests.test_sft_partitions import env, train, NOTEBOOK
 
 
 def test_weights_use_each_cues_own_sft_counts(env, train):
+    assert env['CUE_WEIGHT_ALPHA'] == 0.0
     frame = train.head(8).copy()
     for cue in env['CUES']:
         low, mid, high = env['CUE_LABELS'][cue]
@@ -19,17 +20,38 @@ def test_weights_use_each_cues_own_sft_counts(env, train):
     frame['timbre_cue'] = [env['CUE_LABELS']['timbre'][i] for i in [0, 1, 1, 2, 2, 2, 2, 2]]
     # Legacy openSMILE speaking_rate_cue is deliberately skewed and must be ignored
     frame['speaking_rate_cue'] = ['moderate'] * 8
-    weights = env['inverse_frequency_cue_weights'](frame)
+
+    # Default alpha=0.0 is strictly unweighted (every class weight == 1.0)
+    unweighted = env['inverse_frequency_cue_weights'](frame)
+    assert (unweighted['weight'] == 1.0).all()
+    assert (unweighted['alpha'] == 0.0).all()
+
+    # alpha=1.0 recovers exact inverse-frequency weighting N / (3 * count)
+    weights = env['inverse_frequency_cue_weights'](frame, alpha=1.0)
     lookup = weights.set_index(['cue', 'label']).weight
     assert lookup['pitch_level', 'low'] == pytest.approx(4 / 3)
     assert lookup['pitch_level', 'moderate'] == pytest.approx(2 / 3)
     assert lookup['timbre', 'low (muffled/soft)'] == pytest.approx(8 / 3)
     for _, group in weights.groupby('cue'):
         assert (group['count'] * group.weight).tolist() == pytest.approx([8 / 3] * 3)
+
+    # Intermediate alpha=0.5 interpolates smoothly and preserves mean example weight == 1.0 per cue
+    sqrt_w = env['inverse_frequency_cue_weights'](frame, alpha=0.5)
+    sqrt_lookup = sqrt_w.set_index(['cue', 'label']).weight
+    assert 1.0 < sqrt_lookup['pitch_level', 'low'] < 4 / 3
+    assert 2 / 3 < sqrt_lookup['pitch_level', 'moderate'] < 1.0
+    assert sqrt_lookup['pitch_level', 'low'] / sqrt_lookup['pitch_level', 'moderate'] == pytest.approx(np.sqrt(2))
+    for _, group in sqrt_w.groupby('cue'):
+        assert np.average(group['weight'], weights=group['count']) == pytest.approx(1.0)
+
+    for bad_alpha in [-0.1, 1.1, float('nan')]:
+        with pytest.raises(ValueError, match='CUE_WEIGHT_ALPHA'):
+            env['inverse_frequency_cue_weights'](frame, alpha=bad_alpha)
+
     for invalid in [frame.iloc[:0], frame.assign(pitch_level_cue='moderate'),
                     frame.assign(timbre_cue=None), frame.assign(vocal_energy_cue='loud')]:
         with pytest.raises(ValueError):
-            env['inverse_frequency_cue_weights'](invalid)
+            env['inverse_frequency_cue_weights'](invalid, alpha=1.0)
 
 
 def test_only_inventory_values_are_weighted_including_subwords_and_leading_spaces(env, train):
@@ -200,12 +222,16 @@ def test_run_exports_train_only_counts_and_weighting_metadata(env, train, tmp_pa
     env.update(sft_train=train, OUTPUT_DIR=tmp_path / 'run', EPOCHS=1, split_manifest={'saved': True},
                VAL_CSV=val_csv, quartiles={'saved': True})
     code = next(''.join(c['source']) for c in json.loads(NOTEBOOK.read_text())['cells']
-                if "cue_loss_weights = inverse_frequency_cue_weights(sft_train)" in ''.join(c['source']))
+                if "cue_loss_weights = inverse_frequency_cue_weights(sft_train" in ''.join(c['source']))
     exec(code.split('if EVALUATE_BEFORE:')[0], env)
     saved = pd.read_csv(env['OUTPUT_DIR'] / 'cue_loss_weights.csv')
     pd.testing.assert_frame_equal(saved, env['inverse_frequency_cue_weights'](train))
     manifest = json.loads((env['OUTPUT_DIR'] / 'experiment.json').read_text())
     assert manifest['loss']['weights_source'] == 'sft_train_only'
+    assert manifest['loss']['cue_weight_alpha'] == 0.0
+    assert manifest['loss']['name'] == 'unweighted_assistant_ce'
+    assert manifest['cues'][0] == 'speaking_rate'
     assert manifest['loss']['weighted_spans'] == 'inventory_values_only'
     assert manifest['loss']['other_assistant_token_weight'] == 1.
     assert len(manifest['loss']['weights']) == len(env['CUES']) * 3
+    assert all(w['weight'] == 1.0 for w in manifest['loss']['weights'])

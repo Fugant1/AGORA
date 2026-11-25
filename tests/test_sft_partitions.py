@@ -12,6 +12,7 @@ import pytest
 from scipy.optimize import milp, Bounds, LinearConstraint
 from scipy.sparse import csr_matrix, eye, hstack, vstack
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from tqdm.auto import tqdm
 
 NOTEBOOK = Path(__file__).resolve().parents[1] / 'ser_sft.ipynb'
 
@@ -23,8 +24,8 @@ def env():
                  milp=milp, Bounds=Bounds, LinearConstraint=LinearConstraint,
                  csr_matrix=csr_matrix, eye=eye, hstack=hstack, vstack=vstack,
                  accuracy_score=accuracy_score, precision_recall_fscore_support=precision_recall_fscore_support,
-                 Dataset=object, Trainer=object, display=lambda *args: None)
-    constants = {'CUES', 'CUE_COLUMNS', 'GLOBAL_CUES', 'CUE_LABELS', 'EMOTIONS', 'PERSONA', 'PROMPT_VERSION', 'MODEL_ID', 'SEED'}
+                 Dataset=object, Trainer=object, display=lambda *args: None, tqdm=tqdm)
+    constants = {'CUES', 'CUE_COLUMNS', 'GLOBAL_CUES', 'CUE_LABELS', 'CUE_WEIGHT_ALPHA', 'EVAL_BATCH_SIZE', 'EMOTIONS', 'PERSONA', 'PROMPT_VERSION', 'MODEL_ID', 'SEED'}
     for cell in json.loads(NOTEBOOK.read_text())['cells']:
         if cell['cell_type'] != 'code':
             continue
