@@ -305,13 +305,22 @@ def test_timbre_ordinal_distance_payoff_and_missing_gt_handling():
         "vocal_energy": {"low": 0.25, "moderate": 0.50, "high": 0.25},
         "timbre": {"low (muffled/soft)": 0.25, "moderate (modal)": 0.50, "high (tense/bright)": 0.25},
     }
-    # Default inverse_frequency R2: valid wrong and invalid predictions BOTH score 0.0 (closes invalid-competitor loophole)
+    # Default inverse_frequency R2 (INVERSE_FREQUENCY_ALPHA=0.5): valid wrong and invalid BOTH score 0.0
     raw_wrong, _, hit_wrong = env["score_cue_payoff"]("high", "moderate", "speaking_rate", priors)
     raw_invalid, _, hit_inv = env["score_cue_payoff"]("high", None, "speaking_rate", priors)
     raw_hit_high, _, _ = env["score_cue_payoff"]("high", "high", "speaking_rate", priors)
     raw_hit_mod, _, _ = env["score_cue_payoff"]("moderate", "moderate", "speaking_rate", priors)
     assert raw_wrong == 0.0 and raw_invalid == 0.0 and hit_wrong == 0.0 and hit_inv == 0.0
-    assert raw_hit_high == pytest.approx(2.0 * raw_hit_mod)  # 2x larger UAR gradient on minority 25% vs 50%
+    assert raw_hit_high == pytest.approx(np.sqrt(2.0) * raw_hit_mod)  # sqrt(2):1 ratio at alpha=0.5
+    assert 0.25 * raw_hit_high + 0.50 * raw_hit_mod + 0.25 * raw_hit_high == pytest.approx(1.0)
+
+    # Verify alpha=1.0 recovers exact 2:1 full inverse frequency and alpha=0.0 recovers 1:1 unweighted
+    h1_hi, _, _ = env["score_cue_payoff"]("high", "high", "speaking_rate", priors, inverse_frequency_alpha=1.0)
+    h1_md, _, _ = env["score_cue_payoff"]("moderate", "moderate", "speaking_rate", priors, inverse_frequency_alpha=1.0)
+    assert h1_hi == pytest.approx(4.0 / 3.0) and h1_md == pytest.approx(2.0 / 3.0)
+    h0_hi, _, _ = env["score_cue_payoff"]("high", "high", "speaking_rate", priors, inverse_frequency_alpha=0.0)
+    h0_md, _, _ = env["score_cue_payoff"]("moderate", "moderate", "speaking_rate", priors, inverse_frequency_alpha=0.0)
+    assert h0_hi == pytest.approx(1.0) and h0_md == pytest.approx(1.0)
 
     # Distance-based ablation check (explicit flag)
     m = env["distance_based_payoff_matrix"](priors["timbre"], env["CUE_LABELS"]["timbre"])
@@ -339,6 +348,26 @@ def test_timbre_ordinal_distance_payoff_and_missing_gt_handling():
     assert trace[0]["pitch_level"]["valid_gt"] is False
     assert trace[0]["pitch_level"]["raw"] == 0.0
     assert trace[0]["timbre"]["correct"] is True
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.35, 0.5, 0.75, 1.0])
+def test_tempered_inverse_frequency_alpha_spectrum(alpha):
+    env = load_v3_cpu_env()
+    assert env["INVERSE_FREQUENCY_ALPHA"] == pytest.approx(0.5)
+    report = env["validate_grpo_reward_mathematics"](
+        use_zero_mean=False,
+        use_map=False,
+        use_inverse_frequency=True,
+        use_distance_based_payoff=False,
+        inverse_frequency_alpha=alpha,
+    )
+    assert sum(report["r1_blind_means"].values()) == pytest.approx(1.0, abs=1e-12)
+    for cue_means in report["cue_blind_raw_means"].values():
+        assert sum(cue_means.values()) == pytest.approx(1.0, abs=1e-12)
+
+    for bad_alpha in (-0.1, 1.01, True, False, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="INVERSE_FREQUENCY_ALPHA"):
+            env["compute_hit_miss"]({"low": 0.25, "moderate": 0.5, "high": 0.25}, inverse_frequency_alpha=bad_alpha)
 
 
 def test_hybrid_cue_split_token_alignment_including_multitoken_timbre():
@@ -485,7 +514,11 @@ def test_trainer_and_model_config_safety():
     assert "USE_ZERO_MEAN = False" in flags_cell
     assert "USE_MAP = False" in flags_cell
     assert "USE_INVERSE_FREQUENCY = True" in flags_cell
+    assert "INVERSE_FREQUENCY_ALPHA = 0.5" in flags_cell
     assert "USE_DISTANCE_BASED_PAYOFF = False" in flags_cell
+
+    comp_cell = cell_containing(nb, "def unified_gated_grpo_reward(")
+    assert "REWARD_WEIGHTS = {'r1': 1.0, 'r2': 1.0, 'r3': 0.2}" in comp_cell
 
     init_cell = cell_containing(nb, "training_args = GRPOConfig(")
     assert "num_train_epochs=NUM_TRAIN_EPOCHS" in init_cell
