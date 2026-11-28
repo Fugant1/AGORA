@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OPERA — Safe Multi-User SFT-MT Launcher for LABIC (24 GB NVIDIA GPU)
+# AGORA — Safe Multi-User SFT-MT Launcher for LABIC (24 GB NVIDIA GPU)
 # ==============================================================================
 # Usage:
 #   GPU_ID=0 bash scripts/labic/run_sft.sh

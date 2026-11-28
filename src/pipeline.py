@@ -1,4 +1,4 @@
-"""End-to-end OPERA V4 pipeline orchestrator & CLI (Preprocess -> SFT-MT -> vLLM GRPO v3).
+"""End-to-end AGORA V4 pipeline orchestrator & CLI (Preprocess -> SFT-MT -> vLLM GRPO v3).
 
 Run locally on a 24 GB NVIDIA GPU:
   python -m src.pipeline preprocess --meld-dir /path/to/prep_meld --data-dir data/meld_16k_mono
@@ -49,7 +49,7 @@ from src.training.grpo import run_grpo_training
 from src.training.sft import run_sft_training
 from src.utils.logging import get_logger
 
-logger = get_logger("opera.pipeline")
+logger = get_logger("AGORA.pipeline")
 
 
 def run_data_processing(cfg: DataProcessingConfig) -> Dict[str, Any]:
@@ -158,8 +158,8 @@ def run_data_processing(cfg: DataProcessingConfig) -> Dict[str, Any]:
     return {"train": train_cues, "val": val_cues, "test": clean_test, "quartiles": quartiles}
 
 
-class OPERAPipeline:
-    """Master orchestrator for OPERA V4 (Data Processing -> Multitask SFT -> vLLM GRPO v3)."""
+class AGORAPipeline:
+    """Master orchestrator for AGORA V4 (Data Processing -> Multitask SFT -> vLLM GRPO v3)."""
 
     def __init__(self, config: Optional[ExperimentConfig] = None) -> None:
         self.config = config or ExperimentConfig()
@@ -186,7 +186,7 @@ class OPERAPipeline:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OPERA V4 SER Pipeline (Preprocess / SFT-MT / vLLM GRPO v3)")
+    parser = argparse.ArgumentParser(description="AGORA V4 SER Pipeline (Preprocess / SFT-MT / vLLM GRPO v3)")
     parser.add_argument("stage", choices=("preprocess", "sft", "grpo", "all"))
     parser.add_argument("--project-dir", type=Path, default=Path("."))
     parser.add_argument("--meld-dir", type=Path, default=Path("raw_data/prep_meld"))
@@ -255,7 +255,7 @@ def main(argv: Optional[list] = None) -> None:
         ),
     )
 
-    pipe = OPERAPipeline(cfg)
+    pipe = AGORAPipeline(cfg)
     if args.stage == "preprocess":
         pipe.run_preprocess()
     elif args.stage == "sft":

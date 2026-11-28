@@ -24,7 +24,7 @@ from src.config import (
     CUES,
     EMOTIONS,
     GLOBAL_CUES,
-    GRPOConfig as OperaGRPOConfig,
+    GRPOConfig as AgoraGRPOConfig,
     ModelConfig,
     RewardConfig,
     VALID_EMOTIONS,
@@ -592,7 +592,7 @@ def build_audio_grpo_trainer(
 
 
 def run_grpo_training(
-    grpo_cfg: OperaGRPOConfig,
+    grpo_cfg: AgoraGRPOConfig,
     model_cfg: ModelConfig,
     reward_cfg: RewardConfig,
     vllm_cfg: VLLMConfig,

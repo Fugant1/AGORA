@@ -1,4 +1,4 @@
-"""Canonical constants and typed experiment configurations for OPERA (MELD SER SFT + GRPO v3).
+"""Canonical constants and typed experiment configurations for AGORA (MELD SER SFT + GRPO v3).
 
 Matches `data_processing.ipynb`, `ser_sft.ipynb`, and `ser_grpo_v3.ipynb` exactly,
 with 24 GB VRAM + vLLM rollout defaults for local NVIDIA GPU execution.
@@ -229,7 +229,7 @@ class VLLMConfig:
     enforce_eager: bool = False
     tensor_parallel_size: int = 1
     lora_sync_dir: Path = field(
-        default_factory=lambda: Path(f"/dev/shm/opera_vllm_lora_{os.environ.get('USER', 'user')}")
+        default_factory=lambda: Path(f"/dev/shm/agora_vllm_lora_{os.environ.get('USER', 'user')}")
     )
     use_for_validation: bool = True
 
@@ -307,7 +307,7 @@ class GRPOConfig:
 
 @dataclass
 class ExperimentConfig:
-    """Unified end-to-end OPERA configuration."""
+    """Unified end-to-end AGORA configuration."""
 
     preprocessing: DataProcessingConfig = field(default_factory=DataProcessingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OPERA — Safe One-Time Environment Setup for LABIC (ICMC-USP)
+# AGORA — Safe One-Time Environment Setup for LABIC (ICMC-USP)
 # ==============================================================================
 # Safety guarantees:
 #   - Never uses sudo or touches system packages.
@@ -23,12 +23,12 @@ fi
 
 if [[ "${PROJECT_DIR}" != "${EXP_DIR}"* && "$(readlink -f "${PROJECT_DIR}")" != "$(readlink -f "${EXP_DIR}")"* ]]; then
   echo "[WARN] Project directory '${PROJECT_DIR}' is outside '${EXP_DIR}'."
-  echo "       LABIC recommends keeping projects inside ~/exp/projetos/OPERA for persistence."
+  echo "       LABIC recommends keeping projects inside ~/exp/projetos/AGORA for persistence."
 fi
 
 # 1. Configure persistent caches in ~/exp (idempotent ~/.bashrc block)
-CACHE_BLOCK_START="# >>> OPERA LABIC CACHES >>>"
-CACHE_BLOCK_END="# <<< OPERA LABIC CACHES <<<"
+CACHE_BLOCK_START="# >>> AGORA LABIC CACHES >>>"
+CACHE_BLOCK_END="# <<< AGORA LABIC CACHES <<<"
 if ! grep -Fq "${CACHE_BLOCK_START}" "${HOME}/.bashrc" 2>/dev/null; then
   cat << EOF >> "${HOME}/.bashrc"
 
@@ -44,7 +44,7 @@ ${CACHE_BLOCK_END}
 EOF
   echo "[OK] Added persistent ~/exp cache exports to ~/.bashrc"
 else
-  echo "[OK] ~/.bashrc already has OPERA LABIC cache exports"
+  echo "[OK] ~/.bashrc already has AGORA LABIC cache exports"
 fi
 
 export UV_PYTHON_INSTALL_DIR="${EXP_DIR}/.local/share/uv/python"
@@ -66,7 +66,7 @@ if command -v uv >/dev/null 2>&1; then
   fi
   # shellcheck disable=SC1091
   source "${VENV_DIR}/bin/activate"
-  echo "[INFO] Installing PyTorch (CUDA 12.4) and OPERA + vLLM dependencies..."
+  echo "[INFO] Installing PyTorch (CUDA 12.4) and AGORA + vLLM dependencies..."
   uv pip install torch --index-url https://download.pytorch.org/whl/cu124
   uv pip install \
     "transformers==5.20.2" "trl==1.15.0" vllm peft accelerate bitsandbytes \
@@ -86,7 +86,7 @@ else
 fi
 
 # 3. Verify CPU mathematical parity tests (zero GPU usage)
-echo "[INFO] Running OPERA parity self-check (CPU only)..."
+echo "[INFO] Running AGORA parity self-check (CPU only)..."
 pytest -q tests/test_src_parity.py
 
 echo ""

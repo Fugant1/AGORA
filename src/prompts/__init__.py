@@ -1,4 +1,4 @@
-"""Prompt templates for OPERA SFT and GRPO v3."""
+"""Prompt templates for AGORA SFT and GRPO v3."""
 
 from src.prompts.templates import (
     PERSONA,

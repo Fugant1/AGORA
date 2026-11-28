@@ -2,7 +2,7 @@
 
 Key invariants preserving 100% mathematical parity with ser_grpo_v3.ipynb:
   1. Live LoRA sync: before each generation call, saves ONLY the trainable `'default'` LoRA adapter
-     to a fast RAM-backed directory (`/dev/shm/opera_vllm_lora/step_{N}`) and passes a unique
+     to a fast RAM-backed directory (`/dev/shm/agora_vllm_lora/step_{N}`) and passes a unique
      incrementing `LoRARequest` so rollouts are strictly on-policy draws from the live weights.
   2. Exact sampling params: `temperature=T`, `top_p=1.0`, `top_k=-1`, `n=num_generations`,
      `max_tokens=max_completion_length`, `stop_token_ids=eos_ids`, `include_stop_str_in_output=False`.
@@ -48,7 +48,7 @@ class VLLMRolloutEngine:
             preferred.mkdir(parents=True, exist_ok=True)
             return preferred
         except OSError:
-            fallback = Path(tempfile.mkdtemp(prefix="opera_vllm_lora_"))
+            fallback = Path(tempfile.mkdtemp(prefix="agora_vllm_lora_"))
             return fallback
 
     def initialize(self) -> None:

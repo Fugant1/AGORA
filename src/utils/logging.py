@@ -1,11 +1,11 @@
-"""Structured logging utility for OPERA experiments."""
+"""Structured logging utility for AGORA experiments."""
 
 import logging
 import sys
 from typing import Optional
 
 
-def get_logger(name: str = "opera", level: int = logging.INFO) -> logging.Logger:
+def get_logger(name: str = "agora", level: int = logging.INFO) -> logging.Logger:
     """Creates a formatted console logger for research experiments."""
     logger = logging.getLogger(name)
     if not logger.handlers:

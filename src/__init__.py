@@ -1,4 +1,4 @@
-"""OPERA: Omni-modal Preference Extraction and Ranking Architecture (V4 SFT-MT + Hybrid Cue-Split GRPO v3).
+"""AGORA: Acoustic-Grounded Omni-modal Reasoning for Affect (V4 SFT-MT + Hybrid Cue-Split GRPO v3).
 
 Modular Python package matching `data_processing.ipynb`, `ser_sft.ipynb`, and `ser_grpo_v3.ipynb`,
 with colocated 24 GB-safe vLLM rollout generation for GRPO.
@@ -26,7 +26,10 @@ from src.config import (
     SFTConfig,
     VLLMConfig,
 )
-from src.pipeline import OPERAPipeline, run_data_processing
+from src.pipeline import AGORAPipeline, run_data_processing
+
+# Backward-compatible alias for previously released Python callers.
+OPERAPipeline = AGORAPipeline
 from src.prompts import (
     PERSONA,
     build_bridge_generation_prompt,
@@ -64,6 +67,7 @@ __all__ = [
     "VLLMConfig",
     "GRPOConfig",
     "ExperimentConfig",
+    "AGORAPipeline",
     "OPERAPipeline",
     "run_data_processing",
     "PERSONA",

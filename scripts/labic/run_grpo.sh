@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OPERA — Safe Multi-User GRPO v3 (vLLM) Launcher for LABIC (24 GB NVIDIA GPU)
+# AGORA — Safe Multi-User GRPO v3 (vLLM) Launcher for LABIC (24 GB NVIDIA GPU)
 # ==============================================================================
 # Usage:
 #   GPU_ID=0 bash scripts/labic/run_grpo.sh
@@ -170,7 +170,7 @@ echo "${JOB_PID}" > "${PID_FILE}"
 
 echo ""
 echo "================================================================================"
-echo "[LAUNCHED] OPERA GRPO v3 started safely in background!"
+echo "[LAUNCHED] AGORA GRPO v3 started safely in background!"
 echo "  Run Name  : ${GRPO_RUN_NAME}"
 echo "  SFT Base  : ${SFT_RUN_NAME}"
 echo "  GPU       : ${GPU_ID} (${GPU_NAME}) [CUDA_VISIBLE_DEVICES=${GPU_ID}]"
