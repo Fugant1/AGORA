@@ -1,191 +1,270 @@
-"""End-to-end research orchestration pipeline for OPERA SER-GRPO."""
+"""End-to-end OPERA V4 pipeline orchestrator & CLI (Preprocess -> SFT-MT -> vLLM GRPO v3).
 
+Run locally on a 24 GB NVIDIA GPU:
+  python -m src.pipeline preprocess --meld-dir /path/to/prep_meld --data-dir data/meld_16k_mono
+  python -m src.pipeline sft --run-name full_sft_gender_wxrate_multitask_alpha05_seed42_v4
+  python -m src.pipeline grpo --sft-run-name full_sft_gender_wxrate_multitask_alpha05_seed42_v4 \\
+      --run-name grpo_v3_hybrid_invfreq_4cue_mt_sft_seed42_cuekl005_v4
+  python -m src.pipeline all
+"""
+
+import argparse
+import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from src.acoustics.analyzer import AcousticAnalyzer
-from src.acoustics.diagnostics import SpeakerDiagnostics
-from src.acoustics.features import eGeMAPSExtractor
-from src.acoustics.visualization import AcousticVisualizer
-from src.config import ExperimentConfig
-from src.data.dataset import SERGRPODataset, split_train_val
-from src.data.loader import MELDLoader
-from src.data.sampler import BalancedSampler
-from src.models.qwen_omni import QwenOmniLoader
-from src.prompts.templates import COT_PROMPT
-from src.rewards.accuracy import compute_emotion_weights
-from src.rewards.composite import RewardManager
-from src.training.trainer import SERGRPOTrainer
+import pandas as pd
+
+from src.acoustics.features import (
+    extract_egemaps_cues,
+    filter_training_set_by_duration_and_nonzero_cues,
+)
+from src.acoustics.quartiles import (
+    apply_gender_quartile_classification,
+    compute_gender_acoustic_quartiles,
+)
+from src.config import (
+    ACOUSTIC_CUES,
+    DataProcessingConfig,
+    ExperimentConfig,
+    GRPOConfig,
+    ModelConfig,
+    RewardConfig,
+    SFTConfig,
+    VLLMConfig,
+)
+from src.data.emo_tag import EmoTagWhisperXCleaner, run_emo_tag_cleaning_on_split
+from src.data.gender import classify_and_filter_gender
+from src.data.loader import (
+    all_clean_outputs_cached,
+    export_split_16k_mono,
+    load_meld,
+    verify_split,
+)
+from src.data.whisperx_rate import (
+    add_whisperx_speech_rates_to_clean_train,
+    add_whisperx_speech_rates_to_clean_val,
+)
+from src.training.grpo import run_grpo_training
+from src.training.sft import run_sft_training
 from src.utils.logging import get_logger
 
-logger = get_logger("pipeline")
+logger = get_logger("opera.pipeline")
 
 
-class SERGRPOPipeline:
-    """Orchestrates the complete research workflow:
+def run_data_processing(cfg: DataProcessingConfig) -> Dict[str, Any]:
+    """Execute the full data_processing.ipynb pipeline (MELD -> Gender -> 16k -> EMO-TAG -> eGeMAPS -> Quartiles -> WhisperX rate)."""
+    data_dir = Path(cfg.data_dir)
+    clean_dir = cfg.clean_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
+    clean_dir.mkdir(parents=True, exist_ok=True)
 
-    1. Raw MELD dataset ingestion & validation.
-    2. eGeMAPSv02 feature extraction & caching on raw train set.
-    3. Speaker quantile validity & dynamic range diagnostics.
-    4. Publication-grade acoustic cue visualization (emotion variation & speaker dynamic range).
-    5. Duration-filtered deterministic class balancing & train/val split.
-    6. Multi-objective reward initialization (Weighted Accuracy, Acoustic Grounding, Format).
-    7. 4-bit Quantized Qwen 2.5 Omni model loading with LoRA adaptation.
-    8. GRPO reinforcement learning training execution.
-    """
+    # 1. Load or skip raw MELD splits
+    raw_csvs = {s: data_dir / f"raw_{s}_set.csv" for s in ("train", "val", "test")}
+    if not cfg.overwrite_audio and all(p.is_file() for p in raw_csvs.values()):
+        raw_train = pd.read_csv(raw_csvs["train"])
+        raw_val = pd.read_csv(raw_csvs["val"])
+        raw_test = pd.read_csv(raw_csvs["test"])
+    elif not cfg.overwrite_audio and all_clean_outputs_cached(data_dir):
+        raw_train = raw_val = raw_test = None
+    else:
+        raw_train = load_meld(cfg.meld_dir, "train", archive_path=cfg.archive_path)
+        raw_val = load_meld(cfg.meld_dir, "val", archive_path=cfg.archive_path)
+        raw_test = load_meld(cfg.meld_dir, "test", archive_path=cfg.archive_path)
 
-    def __init__(self, config: Optional[ExperimentConfig] = None):
+    # 2. Gender classification & train filtering
+    if isinstance(raw_train, pd.DataFrame):
+        raw_train = classify_and_filter_gender(raw_train, "raw_train_set", drop_unknown=True)
+    if isinstance(raw_val, pd.DataFrame):
+        raw_val = classify_and_filter_gender(raw_val, "raw_val_set", drop_unknown=False)
+    if isinstance(raw_test, pd.DataFrame):
+        raw_test = classify_and_filter_gender(raw_test, "raw_test_set", drop_unknown=False)
+
+    # 3. 16 kHz mono WAV standardization
+    raw_train = export_split_16k_mono(raw_train, "train", data_dir, cfg.max_workers, cfg.overwrite_audio)
+    raw_val = export_split_16k_mono(raw_val, "val", data_dir, cfg.max_workers, cfg.overwrite_audio)
+    raw_test = export_split_16k_mono(raw_test, "test", data_dir, cfg.max_workers, cfg.overwrite_audio)
+    if isinstance(raw_train, pd.DataFrame):
+        verify_split(raw_train, "raw_train_set")
+    if isinstance(raw_val, pd.DataFrame):
+        verify_split(raw_val, "raw_val_set")
+
+    # 4. EMO-TAG 5-step laughter & overlap cleaning
+    cleaner = EmoTagWhisperXCleaner(whisper_model_name=cfg.whisper_model_name, language=cfg.language)
+    clean_train, _ = run_emo_tag_cleaning_on_split(raw_train, "train", cleaner, clean_dir, cfg.overwrite_audio)
+    clean_val, _ = run_emo_tag_cleaning_on_split(raw_val, "val", cleaner, clean_dir, cfg.overwrite_audio)
+    clean_test, _ = run_emo_tag_cleaning_on_split(raw_test, "test", cleaner, clean_dir, cfg.overwrite_audio)
+
+    # 5. openSMILE eGeMAPSv02 extraction + train integrity gate
+    train_eg_csv = clean_dir / "train_egemaps.csv"
+    val_eg_csv = clean_dir / "val_egemaps.csv"
+    if train_eg_csv.exists() and val_eg_csv.exists() and not cfg.overwrite_audio:
+        train_eg = pd.read_csv(train_eg_csv)
+        val_eg = pd.read_csv(val_eg_csv)
+    else:
+        train_eg = extract_egemaps_cues(clean_train, "train", cfg.max_workers)
+        val_eg = extract_egemaps_cues(clean_val, "val", cfg.max_workers)
+        train_eg = filter_training_set_by_duration_and_nonzero_cues(
+            train_eg,
+            "train",
+            min_dur=cfg.min_train_duration_sec,
+            max_dur=cfg.max_train_duration_sec,
+            delete_rejected_wavs_in_data_dir=cfg.delete_rejected_wavs,
+            data_dir=data_dir,
+        )
+        train_eg.to_csv(train_eg_csv, index=False)
+        val_eg.to_csv(val_eg_csv, index=False)
+
+    # 6. Gender-specific quartile fitting (strictly on train) & classification
+    if cfg.quartiles_json.exists() and cfg.train_csv.exists() and cfg.val_csv.exists() and not cfg.overwrite_audio:
+        quartiles = json.loads(cfg.quartiles_json.read_text(encoding="utf-8"))
+        train_cues = pd.read_csv(cfg.train_csv)
+        val_cues = pd.read_csv(cfg.val_csv)
+    else:
+        quartiles = compute_gender_acoustic_quartiles(train_eg, ACOUSTIC_CUES)
+        train_cues = apply_gender_quartile_classification(train_eg, quartiles, "clean_train_set", ACOUSTIC_CUES)
+        val_cues = apply_gender_quartile_classification(val_eg, quartiles, "clean_val_set", ACOUSTIC_CUES)
+        cfg.quartiles_json.write_text(json.dumps(quartiles, indent=2) + "\n", encoding="utf-8")
+        train_cues.to_csv(cfg.train_csv, index=False)
+        val_cues.to_csv(cfg.val_csv, index=False)
+
+    # 7. Batched WhisperX true syllable & word rate tracking (train-fitted global cutoffs)
+    train_cues = add_whisperx_speech_rates_to_clean_train(
+        cfg.train_csv,
+        drive_dir=cfg.drive_data_dir,
+        batch_size=cfg.whisperx_rate_batch_size,
+        overwrite=cfg.overwrite_whisperx_rate,
+        whisper_model_name=cfg.whisper_model_name,
+        asr_model=cleaner.asr_model,
+        align_model=cleaner.align_model,
+        align_metadata=cleaner.align_metadata,
+        device=cleaner.device,
+    )
+    val_cues = add_whisperx_speech_rates_to_clean_val(
+        cfg.val_csv,
+        cfg.train_csv,
+        split="val",
+        drive_dir=cfg.drive_data_dir,
+        batch_size=cfg.whisperx_rate_batch_size,
+        overwrite=cfg.overwrite_whisperx_rate,
+        whisper_model_name=cfg.whisper_model_name,
+        asr_model=cleaner.asr_model,
+        align_model=cleaner.align_model,
+        align_metadata=cleaner.align_metadata,
+        device=cleaner.device,
+    )
+
+    logger.info("Data processing complete: train=%d, val=%d", len(train_cues), len(val_cues))
+    return {"train": train_cues, "val": val_cues, "test": clean_test, "quartiles": quartiles}
+
+
+class OPERAPipeline:
+    """Master orchestrator for OPERA V4 (Data Processing -> Multitask SFT -> vLLM GRPO v3)."""
+
+    def __init__(self, config: Optional[ExperimentConfig] = None) -> None:
         self.config = config or ExperimentConfig()
 
-    def run_acoustic_analysis(self, raw_train_set: Any, reports_dir: Path = Path("reports/figures")):
-        """Execute acoustic feature extraction, diagnostics, and plotting on raw training set."""
-        logger.info("--- Step 2: Acoustic Feature Extraction (Raw Train Set) ---")
-        extractor = eGeMAPSExtractor(
-            cues_dict=self.config.acoustics.cues,
-            cache_path=self.config.data.cache_path,
-            alt_cache_path=self.config.data.alt_cache_path,
-        )
-        raw_train_set = extractor.extract_or_load(raw_train_set)
+    def run_preprocess(self) -> Dict[str, Any]:
+        return run_data_processing(self.config.preprocessing)
 
-        logger.info("--- Step 3: Speaker Quantile Validity & Long-tail Diagnostics ---")
-        diagnostics = SpeakerDiagnostics(
-            min_utterances_threshold=self.config.acoustics.min_utterances_threshold
-        )
-        diag_results = diagnostics.diagnose(raw_train_set)
+    def run_sft(self) -> Dict[str, Any]:
+        return run_sft_training(self.config.sft, self.config.model)
 
-        logger.info("--- Step 4: Emotion & Speaker Dynamic Range Analysis ---")
-        analyzer = AcousticAnalyzer(
-            cues_dict=self.config.acoustics.cues,
-            top_n_speakers=self.config.acoustics.top_n_speakers,
-        )
-        analysis_results = analyzer.analyze(raw_train_set)
-
-        visualizer = AcousticVisualizer(cues_dict=self.config.acoustics.cues)
-        reports_dir.mkdir(parents=True, exist_ok=True)
-
-        visualizer.plot_emotion_acoustic_distributions(
-            raw_train_set,
-            output_path=reports_dir / "fig1_emotion_acoustic_distributions.png",
+    def run_grpo(self) -> Dict[str, Any]:
+        return run_grpo_training(
+            self.config.grpo,
+            self.config.model,
+            self.config.reward,
+            self.config.vllm,
         )
 
-        if "speaker_relative_amplitudes" in analysis_results:
-            visualizer.plot_speaker_amplitude_coverage(
-                analysis_results["speaker_relative_amplitudes"],
-                top_n_speakers=self.config.acoustics.top_n_speakers,
-                output_path=reports_dir / "fig2_speaker_amplitude_coverage.png",
-            )
+    def run_all(self) -> Dict[str, Any]:
+        prep = self.run_preprocess()
+        sft = self.run_sft()
+        grpo = self.run_grpo()
+        return {"preprocess": prep, "sft": sft, "grpo": grpo}
 
-        return raw_train_set, diag_results, analysis_results
 
-    def run(self, reports_dir: Path = Path("reports/figures"), train_model: bool = False):
-        """Execute complete SER-GRPO research pipeline."""
-        logger.info("================================================================================")
-        logger.info("OPERA: Omni-modal Preference Extraction and Ranking Architecture (SER-GRPO)")
-        logger.info("================================================================================")
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="OPERA V4 SER Pipeline (Preprocess / SFT-MT / vLLM GRPO v3)")
+    parser.add_argument("stage", choices=("preprocess", "sft", "grpo", "all"))
+    parser.add_argument("--project-dir", type=Path, default=Path("."))
+    parser.add_argument("--meld-dir", type=Path, default=Path("raw_data/prep_meld"))
+    parser.add_argument("--data-dir", type=Path, default=Path("data/meld_16k_mono"))
+    parser.add_argument("--split-dir", type=Path, default=SFTConfig.split_dir)
+    parser.add_argument("--partition-mode", choices=("semi_balanced", "uniform"), default="semi_balanced")
+    parser.add_argument("--neutral-fraction", type=float, default=0.25)
+    parser.add_argument("--sft-run-name", type=str, default=SFTConfig.run_name)
+    parser.add_argument("--grpo-run-name", type=str, default=GRPOConfig.run_name)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--beta", type=float, default=0.05)
+    parser.add_argument("--r1-alpha", type=float, default=0.5)
+    parser.add_argument("--alpha", type=float, default=1.0, help="R2 acoustic cue inverse-frequency alpha")
+    parser.add_argument("--r2-weight", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--steps-per-gen", type=int, default=8)
+    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--no-vllm", action="store_true", help="Fallback to HuggingFace generate() instead of vLLM.")
+    parser.add_argument("--vllm-quantization", type=str, default="bitsandbytes", help="bitsandbytes | fp8 | none")
+    parser.add_argument("--vllm-gpu-util", type=float, default=0.35)
+    parser.add_argument("--resume", type=str, default=None)
+    return parser
 
-        # 1. Load Raw Train Set
-        logger.info("--- Step 1: Loading Raw MELD Dataset ---")
-        loader = MELDLoader(
-            archive_path=self.config.data.archive_path,
-            dataset_dir=self.config.data.dataset_dir,
-        )
-        raw_train_set = loader.load(split="train")
 
-        # 2-4. Acoustic Extraction, Diagnostics, and Plots on Raw Train Set
-        raw_train_set, diag_results, analysis_results = self.run_acoustic_analysis(
-            raw_train_set, reports_dir=reports_dir
-        )
+def main(argv: Optional[list] = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+    vllm_quant = None if str(args.vllm_quantization).lower() in ("none", "") else args.vllm_quantization
+    vllm_load = "bitsandbytes" if vllm_quant == "bitsandbytes" else None
 
-        # 5. Balanced Sampling and Train/Val Split
-        logger.info("--- Step 5: Deterministic Balancing & Duration Filtering ---")
-        sampler = BalancedSampler(
-            target_total=self.config.data.target_total,
-            max_neutral_pct=self.config.data.max_neutral_pct,
-            min_duration=self.config.data.min_duration,
-            max_duration=self.config.data.max_duration,
-            seed=self.config.data.seed,
-        )
-        pruned_train_set = sampler.sample(raw_train_set)
+    cfg = ExperimentConfig(
+        preprocessing=DataProcessingConfig(meld_dir=args.meld_dir, data_dir=args.data_dir),
+        model=ModelConfig(),
+        sft=SFTConfig(
+            project_dir=args.project_dir,
+            data_dir=args.data_dir,
+            split_dir=args.split_dir,
+            run_name=args.sft_run_name,
+            partition_mode=args.partition_mode,
+            neutral_target_fraction=args.neutral_fraction,
+            seed=args.seed,
+        ),
+        reward=RewardConfig(
+            r1_inverse_frequency_alpha=args.r1_alpha,
+            inverse_frequency_alpha=args.alpha,
+            reward_weights={"r1": 1.0, "r2": args.r2_weight, "r3": 0.2},
+        ),
+        vllm=VLLMConfig(
+            enabled=not args.no_vllm,
+            quantization=vllm_quant,
+            load_format=vllm_load,
+            gpu_memory_utilization=args.vllm_gpu_util,
+        ),
+        grpo=GRPOConfig(
+            project_dir=args.project_dir,
+            data_dir=args.data_dir,
+            split_dir=args.split_dir,
+            sft_run_name=args.sft_run_name,
+            run_name=args.grpo_run_name,
+            partition_mode=args.partition_mode,
+            resume_checkpoint_dir=args.resume,
+            seed=args.seed,
+            beta=args.beta,
+            per_device_train_batch_size=args.batch_size,
+            steps_per_generation=args.steps_per_gen,
+            gradient_accumulation_steps=args.grad_accum,
+        ),
+    )
 
-        train_set, val_set = split_train_val(
-            pruned_train_set,
-            test_size=self.config.data.test_size,
-            seed=self.config.data.seed,
-            stratify_col="emotion",
-        )
-
-        # 5b. Balanced Sampling for Calibrated Top 6 Speakers (GRPO Training Set)
-        logger.info("--- Step 5b: Balanced Sampling for Top 6 Speakers (Excluding Val, 1s-20s, Non-Zero Acoustics) ---")
-        from src.data.sampler import sample_balanced_top_speakers
-
-        grpo_train_set = sample_balanced_top_speakers(
-            train_df=train_set,
-            val_df=val_set,
-            min_duration=1.0,
-            max_duration=20.0,
-            max_neutral_pct=self.config.data.max_neutral_pct,
-            seed=self.config.data.seed,
-        )
-
-        # 6. Reward Engineering
-        logger.info("--- Step 6: Multi-Objective Reward Configuration ---")
-        class_weights = compute_emotion_weights(
-            grpo_train_set, power=self.config.reward.smoothing_power
-        )
-        from src.rewards.acoustic import (
-            ALL_ACOUSTIC_FEATURES,
-            build_acoustic_audio_lookup,
-            compute_top_speaker_acoustic_quantiles,
-        )
-
-        speaker_quantiles = compute_top_speaker_acoustic_quantiles(
-            raw_train_set, top_n=6, cues_map=ALL_ACOUSTIC_FEATURES, filter_zeroes=True
-        )
-        audio_lookup = build_acoustic_audio_lookup(
-            raw_train_set, features_map=ALL_ACOUSTIC_FEATURES
-        )
-        reward_manager = RewardManager(
-            class_weights=class_weights,
-            quantiles_ref=speaker_quantiles,
-            audio_lookup=audio_lookup,
-        )
-
-        logger.info("Active GRPO reward functions: R1 (Weighted Accuracy), R2 (Acoustic Inventory Grounding), R3 (Format)")
-
-        if not train_model:
-            logger.info("Pipeline data preparation, acoustic diagnostics, and reward setup completed successfully.")
-            return {
-                "train_set": grpo_train_set,
-                "raw_balanced_train_set": train_set,
-                "val_set": val_set,
-                "class_weights": class_weights,
-                "reward_manager": reward_manager,
-                "diagnostics": diag_results,
-                "analysis": analysis_results,
-            }
-
-        # 7. Model and LoRA Loading
-        logger.info("--- Step 7: Model & Adapter Initialization ---")
-        model, processor = QwenOmniLoader.load_model(config=self.config.model)
-
-        # 8. Dataset Formatting for GRPO (using balanced top-6 speakers training set)
-        train_grpo_ds = SERGRPODataset(grpo_train_set, prompt_template=COT_PROMPT).to_hf_dataset()
-        val_grpo_ds = SERGRPODataset(val_set, prompt_template=COT_PROMPT).to_hf_dataset()
-
-        # 9. Launch GRPO Training
-        logger.info("--- Step 8: Launching SER-GRPO Trainer ---")
-        trainer = SERGRPOTrainer(
-            model=model,
-            processor=processor,
-            train_dataset=train_grpo_ds,
-            eval_dataset=val_grpo_ds,
-            reward_funcs=reward_manager.get_reward_functions(),
-            config=self.config.grpo,
-        )
-        trainer.train()
-        logger.info("GRPO Training run completed successfully.")
+    pipe = OPERAPipeline(cfg)
+    if args.stage == "preprocess":
+        pipe.run_preprocess()
+    elif args.stage == "sft":
+        pipe.run_sft()
+    elif args.stage == "grpo":
+        pipe.run_grpo()
+    else:
+        pipe.run_all()
 
 
 if __name__ == "__main__":
-    pipeline = SERGRPOPipeline()
-    pipeline.run()
+    main()

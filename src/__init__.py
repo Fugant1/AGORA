@@ -1,76 +1,81 @@
-"""OPERA: Omni-modal Preference Extraction and Ranking Architecture.
+"""OPERA: Omni-modal Preference Extraction and Ranking Architecture (V4 SFT-MT + Hybrid Cue-Split GRPO v3).
 
-A modular research framework for Speech Emotion Recognition (SER)
-using Group Relative Policy Optimization (GRPO) and physical acoustic grounding.
+Modular Python package matching `data_processing.ipynb`, `ser_sft.ipynb`, and `ser_grpo_v3.ipynb`,
+with colocated 24 GB-safe vLLM rollout generation for GRPO.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-# Expose core configurations and utilities unconditionally
 from src.config import (
-    AcousticsConfig,
-    DataConfig,
+    ACOUSTIC_CUES,
+    CUE_COLUMNS,
+    CUE_LABELS,
+    CUES,
+    DEFAULT_REWARD_WEIGHTS,
+    EMOTIONS,
+    GLOBAL_CUES,
+    MODEL_ID,
+    PROMPT_VERSION,
+    TIMBRE_LABEL_MAP,
+    VALID_EMOTIONS,
+    DataProcessingConfig,
     ExperimentConfig,
     GRPOConfig,
     ModelConfig,
     RewardConfig,
+    SFTConfig,
+    VLLMConfig,
 )
-from src.prompts import COT_PROMPT, QWEN_PERSONA, build_chat_prompt, build_messages
-from src.utils import get_audio_duration, get_logger
+from src.pipeline import OPERAPipeline, run_data_processing
+from src.prompts import (
+    PERSONA,
+    build_bridge_generation_prompt,
+    format_sft_target,
+    gender_context,
+    inventory_text,
+    messages_for,
+    student_instruction,
+)
+from src.rewards import (
+    GRPORewardCalibrator,
+    parse_completion,
+    parse_completion_strict,
+    unified_gated_grpo_reward,
+    validate_grpo_reward_mathematics,
+)
 
-# Domain-specific exports with graceful dependency handling
-try:
-    from src.rewards import (
-        AcousticInventoryReward,
-        ClassWeightedAccuracyReward,
-        CompletionParser,
-        FormatReward,
-        RewardManager,
-        compute_emotion_weights,
-        compute_format_reward,
-        extract_acoustic_inventory,
-        extract_answer_content,
-        extract_reasoning,
-        reward_label_accuracy_weighted,
-    )
-except ImportError:
-    pass
-
-try:
-    from src.data import (
-        ArchiveExtractor,
-        BalancedSampler,
-        MELDLoader,
-        SERGRPODataset,
-        load_meld,
-        sample_balanced_meld,
-        split_train_val,
-    )
-except ImportError:
-    pass
-
-try:
-    from src.acoustics import (
-        DEFAULT_ACOUSTIC_CUES,
-        AcousticAnalyzer,
-        AcousticVisualizer,
-        SpeakerDiagnostics,
-        eGeMAPSExtractor,
-    )
-except ImportError:
-    pass
-
-try:
-    from src.models import QwenOmniLoader, get_lora_config
-except ImportError:
-    pass
-
-try:
-    from src.training import RewardLoggingCallback, SERGRPOTrainer
-except ImportError:
-    pass
-
-try:
-    from src.pipeline import SERGRPOPipeline
-except ImportError:
-    pass
+__all__ = [
+    "__version__",
+    "MODEL_ID",
+    "PROMPT_VERSION",
+    "CUES",
+    "CUE_COLUMNS",
+    "CUE_LABELS",
+    "GLOBAL_CUES",
+    "EMOTIONS",
+    "VALID_EMOTIONS",
+    "TIMBRE_LABEL_MAP",
+    "ACOUSTIC_CUES",
+    "DEFAULT_REWARD_WEIGHTS",
+    "DataProcessingConfig",
+    "ModelConfig",
+    "SFTConfig",
+    "RewardConfig",
+    "VLLMConfig",
+    "GRPOConfig",
+    "ExperimentConfig",
+    "OPERAPipeline",
+    "run_data_processing",
+    "PERSONA",
+    "gender_context",
+    "inventory_text",
+    "student_instruction",
+    "build_bridge_generation_prompt",
+    "format_sft_target",
+    "messages_for",
+    "parse_completion",
+    "parse_completion_strict",
+    "GRPORewardCalibrator",
+    "unified_gated_grpo_reward",
+    "validate_grpo_reward_mathematics",
+]

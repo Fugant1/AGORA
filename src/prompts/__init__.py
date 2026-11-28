@@ -1,5 +1,21 @@
-"""Prompt definitions and formatting for OPERA."""
+"""Prompt templates for OPERA SFT and GRPO v3."""
 
-from src.prompts.templates import COT_PROMPT, QWEN_PERSONA, build_chat_prompt, build_messages
+from src.prompts.templates import (
+    PERSONA,
+    build_bridge_generation_prompt,
+    format_sft_target,
+    gender_context,
+    inventory_text,
+    messages_for,
+    student_instruction,
+)
 
-__all__ = ["COT_PROMPT", "QWEN_PERSONA", "build_chat_prompt", "build_messages"]
+__all__ = [
+    "PERSONA",
+    "gender_context",
+    "inventory_text",
+    "student_instruction",
+    "build_bridge_generation_prompt",
+    "format_sft_target",
+    "messages_for",
+]

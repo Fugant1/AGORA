@@ -1,541 +1,507 @@
-"""R2: Acoustic Inventory physical grounding reward.
+"""R2: Empirical 4-Cue Ordinal Distance-Based, Zero-Mean, MAP, or IF Payoffs (exact match to ser_grpo_v3.ipynb)."""
 
-Evaluates whether the discrete acoustic cues generated during Chain-of-Thought
-reasoning accurately ground to empirical physical eGeMAPS functionals using
-speaker-calibrated quartiles for the top speakers, including composite Voice Quality
-(Jitter, Shimmer, HNR, Hammarberg index).
-"""
+import math
+from typing import Any, Dict, List, Optional, Tuple
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+import numpy as np
+import pandas as pd
 
-if TYPE_CHECKING:
-    import pandas as pd
+from src.config import CUE_COLUMNS, CUE_LABELS, CUES
+from src.rewards.accuracy import (
+    build_payoff_matrix,
+    compute_hit_miss,
+    compute_zero_mean_hit_miss,
+    prove_payoff_matrix,
+    resolve_inverse_frequency_alpha,
+    resolve_reward_mode,
+)
+from src.rewards.parser import parse_completion
 
-from src.rewards.parser import extract_acoustic_inventory, parse_completion
-from src.utils.logging import get_logger
+R2_NORM_SCALE: float = 2.0
+R2_CUE_COUNT: int = len(CUES)
 
-logger = get_logger("rewards.acoustic")
-
-# Mapping of the 4 continuous acoustic descriptors in the prompt to eGeMAPSv02 features
-CUE_FEATURE_MAP: Dict[str, str] = {
-    "pitch_height": "F0semitoneFrom27.5Hz_sma3nz_amean",
-    "pitch_dynamics": "F0semitoneFrom27.5Hz_sma3nz_pctlrange0-2",
-    "vocal_energy": "loudness_sma3_percentile50.0",
-    "speaking_rate": "VoicedSegmentsPerSec",
-}
-
-# Physical features used for composite Voice Quality grounding
-VOICE_QUALITY_FEATURE_MAP: Dict[str, str] = {
-    "jitter": "jitterLocal_sma3nz_amean",
-    "shimmer": "shimmerLocaldB_sma3nz_amean",
-    "hnr": "HNRdBACF_sma3nz_amean",
-    "hammarberg": "hammarbergIndexV_sma3nz_amean",
-}
-
-# Comprehensive dictionary of all acoustic features
-ALL_ACOUSTIC_FEATURES: Dict[str, str] = {
-    **CUE_FEATURE_MAP,
-    **VOICE_QUALITY_FEATURE_MAP,
-}
-
-# Normalization of continuous cue prompt vocabulary to the 3 ordinal tiers (low, moderate, high)
-PRED_TIER_MAP: Dict[str, Dict[str, str]] = {
-    "pitch_height": {
-        "low": "low",
-        "moderate": "moderate",
-        "elevated": "high",
-        "high": "high",
-    },
-    "pitch_dynamics": {
-        "narrow": "low",
-        "low": "low",
-        "moderate": "moderate",
-        "wide": "high",
-        "high": "high",
-    },
-    "vocal_energy": {
-        "quiet": "low",
-        "low": "low",
-        "moderate": "moderate",
-        "loud": "high",
-        "high": "high",
-    },
-    "speaking_rate": {
-        "slow": "low",
-        "low": "low",
-        "moderate": "moderate",
-        "fast": "high",
-        "high": "high",
-    },
-}
-
-# Canonical normalization map for Voice Quality choices
-VOICE_QUALITY_CHOICES: Dict[str, str] = {
-    "pressed/tense": "pressed/tense",
-    "pressed": "pressed/tense",
-    "tense": "pressed/tense",
-    "breathy": "breathy",
-    "harsh/creaky": "harsh/creaky",
-    "harsh": "harsh/creaky",
-    "creaky": "harsh/creaky",
-    "modal/normal": "modal/normal",
-    "modal": "modal/normal",
-    "normal": "modal/normal",
-}
+DISTANCE_MODERATE_HIT = 0.55
+DISTANCE_EXTREME_ON_MODERATE_COST = 0.18
+DISTANCE_MIN_OPPOSITE_COST = 0.56
+DISTANCE_ORDINAL_MARGIN = 0.01
 
 
-def compute_top_speaker_acoustic_quantiles(
-    df: Any,
-    top_n: int = 6,
-    cues_map: Dict[str, str] = ALL_ACOUSTIC_FEATURES,
-    filter_zeroes: bool = True,
-) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """Computes the 4 quantiles (quartiles: Q25 and Q75) for the top N most frequent speakers.
-
-    When filter_zeroes is True, excludes 0.0 values (unvoiced/corrupted frames)
-    from quantile calculation to ensure accurate physical grounding.
-
-    Quantile divisions:
-      - 1st quantile (x <= Q25): Low
-      - 2nd & 3rd quantiles (Q25 < x <= Q75): Moderate
-      - 4th quantile (x > Q75): High
-
-    Includes '__GLOBAL__' as fallback for speakers outside top N.
-    """
-    spk_counts = df["speaker"].value_counts()
-    top_speakers = spk_counts.head(top_n).index.tolist()
-
-    quantiles_dict: Dict[str, Dict[str, Dict[str, float]]] = {}
-
-    strictly_positive_cues = {
-        "F0semitoneFrom27.5Hz_sma3nz_amean",
-        "F0semitoneFrom27.5Hz_sma3nz_pctlrange0-2",
-        "loudness_sma3_percentile50.0",
-        "VoicedSegmentsPerSec",
-        "jitterLocal_sma3nz_amean",
-        "shimmerLocaldB_sma3nz_amean",
-    }
-
-    for spk in top_speakers:
-        sub = df[df["speaker"] == spk]
-        quantiles_dict[spk] = {}
-        for cue_name, col_name in cues_map.items():
-            if col_name in sub.columns:
-                series = sub[col_name].dropna()
-                if filter_zeroes:
-                    series = series[series != 0.0]
-                    if col_name in strictly_positive_cues:
-                        series = series[series > 0.0]
-                if len(series) > 0:
-                    quantiles_dict[spk][cue_name] = {
-                        "q25": float(series.quantile(0.25)),
-                        "q75": float(series.quantile(0.75)),
-                    }
-
-    # Global fallback for speakers with few utterances or out-of-top-N
-    quantiles_dict["__GLOBAL__"] = {}
-    for cue_name, col_name in cues_map.items():
-        if col_name in df.columns:
-            series = df[col_name].dropna()
-            if filter_zeroes:
-                series = series[series != 0.0]
-                if col_name in strictly_positive_cues:
-                    series = series[series > 0.0]
-            if len(series) > 0:
-                quantiles_dict["__GLOBAL__"][cue_name] = {
-                    "q25": float(series.quantile(0.25)),
-                    "q75": float(series.quantile(0.75)),
-                }
-
-    logger.info("Computed acoustic quartiles for top %d speakers (filter_zeroes=%s): %s", len(top_speakers), filter_zeroes, top_speakers)
-    return quantiles_dict
-
-
-def build_acoustic_audio_lookup(
-    df: Any,
-    features_map: Dict[str, str] = ALL_ACOUSTIC_FEATURES,
-) -> Dict[str, Dict[str, Any]]:
-    """Builds O(1) audio_path indexed lookup dictionary for rapid rollout evaluation."""
-    if "audio_path" not in df.columns:
-        return {}
-    cols_to_keep = [c for c in list(features_map.values()) + ["speaker"] if c in df.columns]
-    return df.set_index("audio_path")[cols_to_keep].to_dict(orient="index")
-
-
-def score_acoustic_piece(
-    truth_tier: str,
-    pred_tier: Optional[str],
-    cue_name: Optional[str] = None,
-    weights_dict: Optional[Dict[str, Dict[str, float]]] = None,
-) -> float:
-    """Computes the reward score for an individual continuous acoustic dimension.
-
-    Calibrated via square-root smoothed inverse frequency:
-      - Match: calibrated weight w_c(truth_tier) in (0.0, 1.0].
-      - Mismatch / Missing / None: 0.0.
-    """
-    if pred_tier is None or not truth_tier:
-        return 0.0
-
-    t = str(truth_tier).lower().strip()
-    p = str(pred_tier).lower().strip()
-
-    if p != t:
-        return 0.0
-
-    if weights_dict and cue_name and cue_name in weights_dict and t in weights_dict[cue_name]:
-        return float(weights_dict[cue_name][t])
-
-    # Theoretical fallback for quartiles (25% low, 50% moderate, 25% high):
-    # 0.25 / 0.50 = 0.5 for moderate; 1.0 for low/high
-    if t == "moderate":
-        return 0.5
-    return 1.0
-
-
-def determine_voice_quality_ground_truth(
-    jitter_val: float,
-    shimmer_val: float,
-    hnr_val: float,
-    hammarberg_val: float,
-    quantiles: Dict[str, Dict[str, float]],
+def resolve_acoustic_reward_mode(
+    use_zero_mean: Optional[bool] = None,
+    use_map: Optional[bool] = None,
+    use_inverse_frequency: Optional[bool] = None,
+    use_distance_based_payoff: Optional[bool] = None,
 ) -> str:
-    """Determines physical Voice Quality ground truth from speaker-calibrated quantiles
-    of Jitter, Shimmer, HNR, and Hammarberg index.
-
-    Acoustic Phonetics Criteria:
-      - 'harsh/creaky': Elevated cycle-to-cycle perturbation / aperiodicity (high Jitter/Shimmer, low HNR).
-      - 'breathy': Incomplete glottal closure, steep spectral roll-off (high Hammarberg) or aspiration noise (low HNR).
-      - 'pressed/tense': Vocal fold hyperadduction, flat spectral tilt with boosted higher harmonics (low Hammarberg).
-      - 'modal/normal': Balanced, regular vocal fold vibration (median/moderate acoustics).
-    """
-    def _tier(cue_name: str, val: float) -> str:
-        q = quantiles.get(cue_name, {})
-        q25 = q.get("q25", float("-inf"))
-        q75 = q.get("q75", float("inf"))
-        if val <= q25:
-            return "low"
-        elif val <= q75:
-            return "moderate"
-        else:
-            return "high"
-
-    j_tier = _tier("jitter", jitter_val)
-    s_tier = _tier("shimmer", shimmer_val)
-    h_tier = _tier("hnr", hnr_val)
-    tilt_tier = _tier("hammarberg", hammarberg_val)
-
-    # 1. Harsh / Creaky: High perturbation / cycle-to-cycle instability
-    if (j_tier == "high" and s_tier == "high") or \
-       ((j_tier == "high" or s_tier == "high") and h_tier == "low"):
-        return "harsh/creaky"
-
-    # 2. Breathy: Steep spectral tilt (fundamental dominates) or aspiration noise
-    if tilt_tier == "high" and j_tier != "high":
-        return "breathy"
-    if tilt_tier == "moderate" and h_tier == "low" and j_tier != "high" and s_tier != "high":
-        return "breathy"
-
-    # 3. Pressed / Tense: Hyperadduction (flat tilt, boosted 2-5 kHz band) with periodic vibration
-    if tilt_tier == "low" and j_tier != "high" and s_tier != "high":
-        return "pressed/tense"
-
-    # 4. Modal / Normal: Balanced phonation (fallback)
-    return "modal/normal"
+    base = resolve_reward_mode(use_zero_mean, use_map, use_inverse_frequency)
+    distance = False if use_distance_based_payoff is None else use_distance_based_payoff
+    if not isinstance(distance, (bool, np.bool_)):
+        raise ValueError("use_distance_based_payoff must be a bool.")
+    return "distance_based" if distance else base
 
 
-def score_voice_quality_piece(
-    truth_quality: str,
-    pred_quality: Optional[str],
-    weights_dict: Optional[Dict[str, Dict[str, float]]] = None,
-) -> float:
-    """Computes the reward score for the Voice Quality dimension.
-
-    Calibrated via inverse frequency:
-      - Match: calibrated weight w_vq(truth_quality) in (0.0, 1.0].
-      - Mismatch / Missing / None: 0.0.
-    """
-    if pred_quality is None or not truth_quality:
-        return 0.0
-
-    t = str(truth_quality).lower().strip()
-    p = str(pred_quality).lower().strip()
-
-    if p != t:
-        return 0.0
-
-    if weights_dict and "voice_quality" in weights_dict and t in weights_dict["voice_quality"]:
-        return float(weights_dict["voice_quality"][t])
-
-    # Fallback when weights are not calibrated
-    if t == "modal/normal":
-        return 0.5
-    return 1.0
-
-
-def compute_acoustic_cue_weights(
-    train_df: pd.DataFrame,
-    quantiles_dict: Dict[str, Dict[str, Dict[str, float]]],
-    power: float = 1.0,
-    cues_map: Dict[str, str] = CUE_FEATURE_MAP,
-    vq_map: Dict[str, str] = VOICE_QUALITY_FEATURE_MAP,
+def distance_based_payoff_matrix(
+    cue_priors: Dict[str, float],
+    ordered_labels: Tuple[str, str, str] = ("low", "moderate", "high"),
 ) -> Dict[str, Dict[str, float]]:
-    """Computes calibrated weights via square-root smoothed inverse frequency (power=0.5)
-    for each category across all 5 acoustic cues on the GRPO training set.
-
-    Formula:
-      w_c(k) = (min_j f_c(j) / f_c(k)) ** 0.5
-
-    Guarantees:
-      1. Every acoustic cue is calibrated to the empirical distribution in the dataset.
-      2. The maximum score per cue is exactly 1.0 (scale [0.0, 1.0] per cue).
-      3. Normalized reward is strictly in [0.0, 1.0].
-      4. Eliminates arbitrary 'moderate' penalties and blind extreme bonuses.
-    """
-    counts: Dict[str, Dict[str, int]] = {
-        cue: {"low": 0, "moderate": 0, "high": 0} for cue in cues_map
-    }
-    counts["voice_quality"] = {
-        "modal/normal": 0,
-        "pressed/tense": 0,
-        "breathy": 0,
-        "harsh/creaky": 0,
+    if len(ordered_labels) != 3:
+        raise ValueError("Ordinal distance payoffs require exactly 3 ordered labels.")
+    if set(cue_priors) != set(ordered_labels):
+        raise ValueError(f"Distance payoffs require empirical priors for {ordered_labels}, got {tuple(cue_priors)}.")
+    validated = compute_zero_mean_hit_miss(cue_priors)
+    low_lbl, mod_lbl, high_lbl = ordered_labels
+    low, moderate, high = validated[low_lbl]["prior"], validated[mod_lbl]["prior"], validated[high_lbl]["prior"]
+    a, b = DISTANCE_MODERATE_HIT, DISTANCE_EXTREME_ON_MODERATE_COST
+    adjacent = a * moderate / (low + high)
+    opposite = max(DISTANCE_MIN_OPPOSITE_COST, adjacent + DISTANCE_ORDINAL_MARGIN)
+    hit_low = (b * moderate + opposite * high) / low
+    hit_high = (opposite * low + b * moderate) / high
+    return {
+        low_lbl: {low_lbl: hit_low, mod_lbl: -adjacent, high_lbl: -opposite},
+        mod_lbl: {low_lbl: -b, mod_lbl: a, high_lbl: -b},
+        high_lbl: {low_lbl: -opposite, mod_lbl: -adjacent, high_lbl: hit_high},
     }
 
-    for _, row in train_df.iterrows():
-        spk = row.get("speaker", "__GLOBAL__")
-        spk_q = quantiles_dict.get(spk, quantiles_dict.get("__GLOBAL__", {}))
 
-        for cue_name, feat_col in cues_map.items():
-            if feat_col in row and not pd.isna(row[feat_col]) and cue_name in spk_q:
-                val = float(row[feat_col])
-                q25 = spk_q[cue_name]["q25"]
-                q75 = spk_q[cue_name]["q75"]
-                if val <= q25:
-                    counts[cue_name]["low"] += 1
-                elif val <= q75:
-                    counts[cue_name]["moderate"] += 1
-                else:
-                    counts[cue_name]["high"] += 1
-
-        vq_vals = {}
-        for sub_cue, col_name in vq_map.items():
-            if col_name in row and not pd.isna(row[col_name]):
-                vq_vals[sub_cue] = float(row[col_name])
-
-        if len(vq_vals) == len(vq_map) and all(k in spk_q for k in vq_vals):
-            vq_gt = determine_voice_quality_ground_truth(
-                jitter_val=vq_vals["jitter"],
-                shimmer_val=vq_vals["shimmer"],
-                hnr_val=vq_vals["hnr"],
-                hammarberg_val=vq_vals["hammarberg"],
-                quantiles=spk_q,
-            )
-            if vq_gt in counts["voice_quality"]:
-                counts["voice_quality"][vq_gt] += 1
-
-    weights_dict: Dict[str, Dict[str, float]] = {}
-
-    for cue_name, cat_counts in counts.items():
-        total_valid = sum(cat_counts.values())
-        weights_dict[cue_name] = {}
-
-        if total_valid == 0:
-            for cat in cat_counts:
-                weights_dict[cue_name][cat] = 0.5 if cat in ("moderate", "modal/normal") else 1.0
-            continue
-
-        freqs = {
-            cat: cnt / total_valid
-            for cat, cnt in cat_counts.items()
-            if cnt > 0
-        }
-
-        raw_inv = {
-            cat: (1.0 / freqs[cat]) ** power if cat in freqs else 0.0
-            for cat in cat_counts
-        }
-        max_inv = max(raw_inv.values()) if raw_inv else 1.0
-
-        for cat, inv_val in raw_inv.items():
-            weights_dict[cue_name][cat] = round(float(inv_val / max_inv), 6) if max_inv > 0 else 0.0
-
-    return weights_dict
+def prove_distance_payoff_matrix(
+    priors: Dict[str, float],
+    matrix: Dict[str, Dict[str, float]],
+    ordered_labels: Tuple[str, str, str],
+) -> Dict[str, Any]:
+    low_lbl, mod_lbl, high_lbl = ordered_labels
+    probabilities = {c: info["prior"] for c, info in compute_zero_mean_hit_miss(priors).items()}
+    means = {p: math.fsum(probabilities[t] * matrix[t][p] for t in ordered_labels) for p in ordered_labels}
+    bound = max(1.0, max(abs(v) for row in matrix.values() for v in row.values()))
+    centered = all(abs(v) <= 1e-12 * bound for v in means.values())
+    hits_win = all(
+        matrix[t][t] > max(v for p, v in row.items() if p != t)
+        for t, row in matrix.items()
+    )
+    ordered = (
+        matrix[low_lbl][low_lbl] > matrix[low_lbl][mod_lbl] > matrix[low_lbl][high_lbl]
+        and matrix[high_lbl][high_lbl] > matrix[high_lbl][mod_lbl] > matrix[high_lbl][low_lbl]
+    )
+    if not (centered and hits_win and ordered):
+        raise ArithmeticError("Distance payoff failed zero-mean or ordinal ordering checks.")
+    return {
+        "mode": "distance_based",
+        "zero_mean_satisfied": centered,
+        "prior_random_zero_mean_satisfied": centered,
+        "column_blind_means": means,
+        "ordinal_satisfied": ordered,
+        "hits_beat_misses": hits_win,
+        "unit_contrast_satisfied": False,
+        "map_satisfied": False,
+        "inverse_frequency_satisfied": False,
+    }
 
 
-class AcousticInventoryReward:
-    """R2 Reward function evaluating Acoustic Inventory grounding against speaker quartiles."""
-
-    def __init__(
-        self,
-        quantiles_ref: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
-        weights_ref: Optional[Dict[str, Dict[str, float]]] = None,
-        audio_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
-        normalize: bool = False,
-        normalize_by_max_possible: bool = False,
+def get_ordinal_cue_payoff_matrix(
+    cue_priors: Dict[str, float],
+    cue_name: str,
+    *,
+    use_zero_mean: Optional[bool] = None,
+    use_map: Optional[bool] = None,
+    use_inverse_frequency: Optional[bool] = None,
+    use_distance_based_payoff: Optional[bool] = None,
+    inverse_frequency_alpha: Optional[float] = None,
+) -> Dict[str, Dict[str, float]]:
+    if cue_name not in CUE_LABELS:
+        raise ValueError(f"Unknown acoustic cue: {cue_name!r}")
+    ordered_labels = CUE_LABELS[cue_name]
+    if (
+        resolve_acoustic_reward_mode(
+            use_zero_mean, use_map, use_inverse_frequency, use_distance_based_payoff
+        )
+        == "distance_based"
     ):
-        self.quantiles_ref = quantiles_ref or {}
-        self.weights_ref = weights_ref or {}
-        self.audio_lookup = audio_lookup or {}
-        self.normalize = normalize
-        self.normalize_by_max_possible = normalize_by_max_possible
+        return distance_based_payoff_matrix(cue_priors, ordered_labels)
+    return build_payoff_matrix(
+        cue_priors,
+        ordered_labels,
+        use_zero_mean=use_zero_mean,
+        use_map=use_map,
+        use_inverse_frequency=use_inverse_frequency,
+        inverse_frequency_alpha=inverse_frequency_alpha,
+    )
 
-    def set_quantiles(self, quantiles_ref: Dict[str, Dict[str, Dict[str, float]]]) -> None:
-        """Update active speaker quantiles reference."""
-        self.quantiles_ref = quantiles_ref
 
-    def set_weights(self, weights_ref: Dict[str, Dict[str, float]]) -> None:
-        """Update calibrated acoustic cue weights reference."""
-        self.weights_ref = weights_ref
+def get_acoustic_reward_scale(
+    priors_dict: Optional[Dict[str, Dict[str, float]]] = None,
+    *,
+    use_distance_based_payoff: Optional[bool] = None,
+) -> float:
+    distance = False if use_distance_based_payoff is None else use_distance_based_payoff
+    if not isinstance(distance, (bool, np.bool_)):
+        raise ValueError("use_distance_based_payoff must be a bool.")
+    if not distance:
+        return 1.0
+    if not priors_dict:
+        raise ValueError("Empirical calibration is required for distance normalization.")
+    matrices = [distance_based_payoff_matrix(priors_dict[cue], CUE_LABELS[cue]) for cue in CUES]
+    return max([1.0] + [abs(v) for m in matrices for row in m.values() for v in row.values()])
 
-    def set_audio_lookup(self, audio_lookup: Dict[str, Dict[str, Any]]) -> None:
-        """Update audio_path -> feature cache lookup."""
-        self.audio_lookup = audio_lookup
 
-    def __call__(
-        self,
-        prompts: List[str],
-        completions: List[str],
-        return_gate_scores: bool = False,
-        **kwargs: Any,
-    ) -> Any:
-        """Compute R2 acoustic inventory rewards for a batch of GRPO rollouts.
+def normalize_acoustic_reward(
+    raw_scores: List[float],
+    max_possible_scores: Optional[List[float]] = None,
+    *,
+    use_zero_mean: Optional[bool] = None,
+    use_map: Optional[bool] = None,
+    use_inverse_frequency: Optional[bool] = None,
+    use_distance_based_payoff: Optional[bool] = None,
+    priors_dict: Optional[Dict[str, Dict[str, float]]] = None,
+) -> float:
+    """Normalize per-cue acoustic scores to [0, 1] across the 4 ordinal inventory slots."""
+    if len(raw_scores) > R2_CUE_COUNT:
+        raise ValueError("More acoustic scores than inventory slots.")
+    mode = resolve_acoustic_reward_mode(
+        use_zero_mean, use_map, use_inverse_frequency, use_distance_based_payoff
+    )
+    if mode == "distance_based":
+        scale = get_acoustic_reward_scale(priors_dict, use_distance_based_payoff=True)
+        result = 0.5 + math.fsum(raw_scores) / (R2_NORM_SCALE * scale * R2_CUE_COUNT)
+        if not -1e-12 <= result <= 1.0 + 1e-12:
+            raise ValueError("Distance scores exceed the frozen calibration bounds.")
+        return float(max(0.0, min(1.0, result)))
+    if mode == "inverse_frequency":
+        if max_possible_scores is None:
+            raise ValueError("max_possible_scores is required in inverse_frequency mode.")
+        if len(max_possible_scores) != len(raw_scores):
+            raise ValueError("raw_scores and max_possible_scores must have identical length.")
+        max_sum = math.fsum(max_possible_scores)
+        if max_sum <= 0.0:
+            return 0.0
+        return float(max(0.0, min(1.0, math.fsum(raw_scores) / max_sum)))
+    return float(max(0.0, min(1.0, 0.5 + math.fsum(raw_scores) / (R2_NORM_SCALE * R2_CUE_COUNT))))
 
-        Returns:
-            List of float rewards per completion (or tuple (rewards, gate_rewards) if return_gate_scores=True).
-        """
-        rewards: List[float] = []
-        gate_rewards: List[float] = []
 
-        speakers = kwargs.get("speaker", [None] * len(completions))
-        audio_paths = kwargs.get("audio_path", [None] * len(completions))
-        parsed_list = kwargs.get("parsed_completions")
-        active_weights = kwargs.get("acoustic_cue_weights", self.weights_ref)
-
-        for idx, comp in enumerate(completions):
-            if parsed_list is not None and idx < len(parsed_list):
-                parsed_inv = parsed_list[idx]["inventory"]
-            else:
-                parsed_inv = parse_completion(comp)["inventory"]
-
-            spk = speakers[idx] if idx < len(speakers) else None
-            audio_p = audio_paths[idx] if idx < len(audio_paths) else None
-
-            lookup_data = self.audio_lookup.get(audio_p, {}) if audio_p else {}
-            if spk is None:
-                spk = lookup_data.get("speaker", "__GLOBAL__")
-
-            spk_q = self.quantiles_ref.get(
-                spk, self.quantiles_ref.get("__GLOBAL__", {})
+def compute_acoustic_cue_priors(
+    train_df: pd.DataFrame,
+    return_counts: bool = False,
+    *,
+    use_zero_mean: Optional[bool] = None,
+    use_map: Optional[bool] = None,
+    use_inverse_frequency: Optional[bool] = None,
+    inverse_frequency_alpha: Optional[float] = None,
+) -> Any:
+    """Count authoritative precomputed cue labels directly on grpo_train_set; never refit or smooth."""
+    resolve_reward_mode(use_zero_mean, use_map, use_inverse_frequency)
+    counts: Dict[str, Dict[str, int]] = {}
+    priors: Dict[str, Dict[str, float]] = {}
+    for cue in CUES:
+        col = CUE_COLUMNS[cue]
+        if col not in train_df.columns:
+            raise ValueError(f"grpo_train_set is missing required cue column: {col}")
+        series = train_df[col].dropna().astype(str).str.strip().str.lower()
+        unknown = set(series) - set(CUE_LABELS[cue])
+        if unknown:
+            raise ValueError(f"Unknown {cue} labels in GRPO calibration: {sorted(unknown)}")
+        cat_counts = {lbl: int((series == lbl).sum()) for lbl in CUE_LABELS[cue]}
+        total = sum(cat_counts.values())
+        counts[cue] = cat_counts
+        priors[cue] = {lbl: (cnt / total if total else 0.0) for lbl, cnt in cat_counts.items()}
+        try:
+            compute_hit_miss(
+                priors[cue],
+                use_zero_mean=use_zero_mean,
+                use_map=use_map,
+                use_inverse_frequency=use_inverse_frequency,
+                inverse_frequency_alpha=inverse_frequency_alpha,
             )
+        except ValueError as exc:
+            raise ValueError(f"Cannot calibrate acoustic cue {cue!r}: {exc}") from exc
+    return (priors, counts) if return_counts else priors
 
-            cue_scores: Dict[str, float] = {}
-            cue_max_scores: Dict[str, float] = {}
 
-            # 1. Evaluate 4 continuous physical acoustic dimensions
-            for cue_name, feat_col in CUE_FEATURE_MAP.items():
-                val = None
-                if feat_col in kwargs and idx < len(kwargs[feat_col]):
-                    val = kwargs[feat_col][idx]
-                elif feat_col in lookup_data:
-                    val = lookup_data[feat_col]
+def calibrate_acoustic_payoffs(
+    grpo_train_df: pd.DataFrame,
+    validation_df: Optional[pd.DataFrame] = None,
+    *,
+    use_zero_mean: Optional[bool] = None,
+    use_map: Optional[bool] = None,
+    use_inverse_frequency: Optional[bool] = None,
+    use_distance_based_payoff: Optional[bool] = None,
+    inverse_frequency_alpha: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Derive 4-cue ordinal payoff matrices strictly from grpo_train_set's saved cue columns."""
+    mode = resolve_acoustic_reward_mode(
+        use_zero_mean, use_map, use_inverse_frequency, use_distance_based_payoff
+    )
+    if grpo_train_df is None or grpo_train_df.empty:
+        raise ValueError("Non-empty grpo_train_set is required for acoustic calibration.")
+    if (
+        validation_df is not None
+        and "audio_path" in validation_df.columns
+        and "audio_path" in grpo_train_df.columns
+    ):
+        overlap = set(grpo_train_df["audio_path"].astype(str)) & set(validation_df["audio_path"].astype(str))
+        if overlap:
+            raise ValueError(f"grpo_train_set overlaps validation audio paths: {len(overlap)}")
 
-                if val is None or cue_name not in spk_q:
-                    continue
+    alpha = resolve_inverse_frequency_alpha(inverse_frequency_alpha)
+    priors, counts = compute_acoustic_cue_priors(
+        grpo_train_df,
+        return_counts=True,
+        use_zero_mean=use_zero_mean,
+        use_map=use_map,
+        use_inverse_frequency=use_inverse_frequency,
+        inverse_frequency_alpha=alpha,
+    )
 
-                q25 = spk_q[cue_name]["q25"]
-                q75 = spk_q[cue_name]["q75"]
-
-                # Physical truth quartile classification
-                if val <= q25:
-                    truth_tier = "low"
-                elif val <= q75:
-                    truth_tier = "moderate"
-                else:
-                    truth_tier = "high"
-
-                # Parse and map model prediction
-                raw_pred = parsed_inv.get(cue_name)
-                pred_tier = None
-                if raw_pred:
-                    raw_clean = str(raw_pred).lower().strip()
-                    pred_tier = PRED_TIER_MAP.get(cue_name, {}).get(raw_clean)
-
-                cue_scores[cue_name] = score_acoustic_piece(
-                    truth_tier, pred_tier, cue_name=cue_name, weights_dict=active_weights
+    if mode == "distance_based":
+        matrices = {cue: distance_based_payoff_matrix(priors[cue], CUE_LABELS[cue]) for cue in CUES}
+        proofs = {cue: prove_distance_payoff_matrix(priors[cue], matrices[cue], CUE_LABELS[cue]) for cue in CUES}
+        payoffs, rows = {}, []
+        for cue in CUES:
+            matrix = matrices[cue]
+            payoffs[cue] = {}
+            for pred in CUE_LABELS[cue]:
+                misses = [matrix[t][pred] for t in CUE_LABELS[cue] if t != pred]
+                info = {
+                    "mode": "distance_based",
+                    "prior": priors[cue][pred],
+                    "hit": matrix[pred][pred],
+                    "min_miss": min(misses),
+                    "max_miss": max(misses),
+                    "e_blind": proofs[cue]["column_blind_means"][pred],
+                }
+                payoffs[cue][pred] = info
+                rows.append(
+                    {
+                        "Cue": cue,
+                        "Category": pred,
+                        "Count": counts[cue][pred],
+                        "Prior": info["prior"],
+                        "Hit": info["hit"],
+                        "Min miss": info["min_miss"],
+                        "Max miss": info["max_miss"],
+                        "E[blind]": info["e_blind"],
+                        "Mode": "distance_based",
+                    }
                 )
-                cue_max_scores[cue_name] = score_acoustic_piece(
-                    truth_tier, truth_tier, cue_name=cue_name, weights_dict=active_weights
-                )
+        return {
+            "mode": "distance_based",
+            "use_distance_based_payoff": True,
+            "normalization_scale": get_acoustic_reward_scale(priors, use_distance_based_payoff=True),
+            "priors": priors,
+            "counts": counts,
+            "matrices": matrices,
+            "proofs": proofs,
+            "payoffs": payoffs,
+            "summary": pd.DataFrame(rows).set_index(["Cue", "Category"]),
+            "grpo_rows": len(grpo_train_df),
+        }
 
-            # 2. Evaluate composite Voice Quality (Jitter, Shimmer, HNR, Hammarberg)
-            vq_vals = {}
-            for sub_cue, col_name in VOICE_QUALITY_FEATURE_MAP.items():
-                v = None
-                if col_name in kwargs and idx < len(kwargs[col_name]):
-                    v = kwargs[col_name][idx]
-                elif col_name in lookup_data:
-                    v = lookup_data[col_name]
-                if v is not None:
-                    vq_vals[sub_cue] = float(v)
+    payoffs = {
+        cue: compute_hit_miss(
+            priors[cue],
+            use_zero_mean=use_zero_mean,
+            use_map=use_map,
+            use_inverse_frequency=use_inverse_frequency,
+            inverse_frequency_alpha=alpha,
+        )
+        for cue in CUES
+    }
+    matrices = {
+        cue: get_ordinal_cue_payoff_matrix(
+            priors[cue],
+            cue,
+            use_zero_mean=use_zero_mean,
+            use_map=use_map,
+            use_inverse_frequency=use_inverse_frequency,
+            use_distance_based_payoff=use_distance_based_payoff,
+            inverse_frequency_alpha=alpha,
+        )
+        for cue in CUES
+    }
+    proofs = {
+        cue: prove_payoff_matrix(
+            priors[cue],
+            matrices[cue],
+            use_zero_mean=use_zero_mean,
+            use_map=use_map,
+            use_inverse_frequency=use_inverse_frequency,
+            inverse_frequency_alpha=alpha,
+        )
+        for cue in CUES
+    }
+    rows = []
+    for cue in CUES:
+        for category, p in payoffs[cue].items():
+            rows.append(
+                {
+                    "Cue": cue,
+                    "Category": category,
+                    "Mode": p["mode"],
+                    "Count": counts[cue][category],
+                    "Prior": p["prior"],
+                    "Prior_Baseline": p["prior_baseline"],
+                    "Hit": p["hit"],
+                    "Miss": p["miss"],
+                    "Delta": p["delta"],
+                    "E[blind]": p["e_blind"],
+                    "E[prior_random]": p["e_prior_random"],
+                    "Zero_Mean": p["zero_mean_consistent"],
+                    "MAP_Consistent": p["map_consistent"],
+                }
+            )
+    return {
+        "mode": mode,
+        "inverse_frequency_alpha": alpha if mode == "inverse_frequency" else None,
+        "use_distance_based_payoff": False,
+        "normalization_scale": 1.0,
+        "priors": priors,
+        "counts": counts,
+        "matrices": matrices,
+        "proofs": proofs,
+        "payoffs": payoffs,
+        "summary": pd.DataFrame(rows).set_index(["Cue", "Category"]),
+        "grpo_rows": len(grpo_train_df),
+    }
 
-            if len(vq_vals) == len(VOICE_QUALITY_FEATURE_MAP):
-                truth_vq = determine_voice_quality_ground_truth(
-                    jitter_val=vq_vals["jitter"],
-                    shimmer_val=vq_vals["shimmer"],
-                    hnr_val=vq_vals["hnr"],
-                    hammarberg_val=vq_vals["hammarberg"],
-                    quantiles=spk_q,
-                )
-                raw_vq_pred = parsed_inv.get("voice_quality")
-                pred_vq = None
-                if raw_vq_pred:
-                    raw_vq_clean = str(raw_vq_pred).lower().strip()
-                    pred_vq = VOICE_QUALITY_CHOICES.get(raw_vq_clean)
 
-                cue_scores["voice_quality"] = score_voice_quality_piece(
-                    truth_vq, pred_vq, weights_dict=active_weights
-                )
-                cue_max_scores["voice_quality"] = score_voice_quality_piece(
-                    truth_vq, truth_vq, weights_dict=active_weights
-                )
+def score_cue_payoff(
+    truth_label: str,
+    pred_label: Optional[str],
+    cue_name: str,
+    priors_dict: Dict[str, Dict[str, float]],
+    *,
+    use_zero_mean: Optional[bool] = None,
+    use_map: Optional[bool] = None,
+    use_inverse_frequency: Optional[bool] = None,
+    use_distance_based_payoff: Optional[bool] = None,
+    inverse_frequency_alpha: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    """Return (raw payoff, truth hit payoff, exact match) for one cue under the active mode."""
+    mode = resolve_acoustic_reward_mode(
+        use_zero_mean, use_map, use_inverse_frequency, use_distance_based_payoff
+    )
+    if cue_name not in priors_dict:
+        raise ValueError(f"No empirical calibration for cue {cue_name!r}.")
+    matrix = get_ordinal_cue_payoff_matrix(
+        priors_dict[cue_name],
+        cue_name,
+        use_zero_mean=use_zero_mean,
+        use_map=use_map,
+        use_inverse_frequency=use_inverse_frequency,
+        use_distance_based_payoff=use_distance_based_payoff,
+        inverse_frequency_alpha=inverse_frequency_alpha,
+    )
+    truth = str(truth_label).lower().strip()
+    if truth not in matrix:
+        raise ValueError(f"Unknown truth label for {cue_name}: {truth_label!r}")
+    pred = str(pred_label).lower().strip() if pred_label is not None else None
+    hit_reward = float(matrix[truth][truth])
+    if pred not in matrix[truth]:
+        if mode == "distance_based":
+            return -get_acoustic_reward_scale(priors_dict, use_distance_based_payoff=True), hit_reward, 0.0
+        return (0.0 if mode == "inverse_frequency" else -1.0), hit_reward, 0.0
+    return float(matrix[truth][pred]), hit_reward, float(pred == truth)
 
-            if cue_scores:
-                total = sum(cue_scores.values())
-                max_total = sum(cue_max_scores.values())
-                gate_score = (total / max_total) if max_total > 0 else 0.0
-                if self.normalize_by_max_possible:
-                    score = gate_score if self.normalize else (gate_score * len(cue_scores))
-                else:
-                    score = (total / len(cue_scores)) if self.normalize else total
-                rewards.append(round(float(score), 4))
-                gate_rewards.append(round(float(gate_score), 4))
-            else:
-                rewards.append(0.0)
-                gate_rewards.append(0.0)
 
-        if return_gate_scores:
-            return rewards, gate_rewards
-        return rewards
+def _clean_gt_label(val: Any, cue: str) -> Optional[str]:
+    if val is None or pd.isna(val):
+        return None
+    s = str(val).strip().lower()
+    return s if s in CUE_LABELS[cue] else None
 
 
 def reward_acoustic_inventory(
     prompts: List[str],
     completions: List[str],
-    quantiles_ref: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
-    weights_ref: Optional[Dict[str, Dict[str, float]]] = None,
-    audio_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
-    normalize: bool = False,
-    normalize_by_max_possible: bool = False,
+    *,
+    priors_dict: Dict[str, Dict[str, float]],
+    audio_lookup: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
     return_gate_scores: bool = False,
     **kwargs: Any,
 ) -> Any:
-    """Functional wrapper for AcousticInventoryReward."""
-    rewarder = AcousticInventoryReward(
-        quantiles_ref=quantiles_ref,
-        weights_ref=weights_ref,
-        audio_lookup=audio_lookup,
-        normalize=normalize,
-        normalize_by_max_possible=normalize_by_max_possible,
-    )
-    return rewarder(prompts, completions, return_gate_scores=return_gate_scores, **kwargs)
+    """Compute 4-cue R2 in [0, 1] directly against precomputed cue columns."""
+    use_distance_based_payoff = kwargs.get("use_distance_based_payoff")
+    use_zero_mean = kwargs.get("use_zero_mean")
+    use_map = kwargs.get("use_map")
+    use_inverse_frequency = kwargs.get("use_inverse_frequency")
+    inverse_frequency_alpha = kwargs.get("inverse_frequency_alpha")
+    resolve_acoustic_reward_mode(use_zero_mean, use_map, use_inverse_frequency, use_distance_based_payoff)
+
+    if not priors_dict:
+        raise ValueError("Empirical cue priors_dict is required before scoring R2.")
+
+    cue_trace_sink = kwargs.get("_cue_trace_sink")
+    audio_paths = kwargs.get("audio_path", [None] * len(completions))
+    parsed_list = kwargs.get("parsed_completions")
+    rewards: List[float] = []
+    gate_rewards: List[float] = []
+
+    for idx, comp in enumerate(completions):
+        parsed_inv = (
+            parsed_list[idx]["inventory"]
+            if (parsed_list is not None and idx < len(parsed_list))
+            else parse_completion(comp)["inventory"]
+        )
+        audio_p = audio_paths[idx] if idx < len(audio_paths) else None
+        lookup_data = audio_lookup.get(audio_p, {}) if (audio_p and audio_lookup) else {}
+
+        cue_details = {
+            c: {"raw": 0.0, "truth": None, "pred": None, "valid_gt": False, "correct": False}
+            for c in CUES
+        }
+        achieved_scores: List[float] = []
+        max_possible_scores: List[float] = []
+        unweighted_hits = 0.0
+        total_cues = 0
+
+        for cue in CUES:
+            col = CUE_COLUMNS[cue]
+            raw_gt = None
+            if col in kwargs and idx < len(kwargs[col]):
+                raw_gt = kwargs[col][idx]
+            elif cue in kwargs and idx < len(kwargs[cue]):
+                raw_gt = kwargs[cue][idx]
+            elif col in lookup_data:
+                raw_gt = lookup_data[col]
+            truth_lbl = _clean_gt_label(raw_gt, cue)
+            if truth_lbl is None:
+                continue
+
+            pred_lbl = parsed_inv.get(cue)
+            sc, mx, hit = score_cue_payoff(
+                truth_lbl,
+                pred_lbl,
+                cue,
+                priors_dict,
+                use_zero_mean=use_zero_mean,
+                use_map=use_map,
+                use_inverse_frequency=use_inverse_frequency,
+                use_distance_based_payoff=use_distance_based_payoff,
+                inverse_frequency_alpha=inverse_frequency_alpha,
+            )
+            cue_details[cue] = {
+                "raw": float(sc),
+                "truth": truth_lbl,
+                "pred": pred_lbl,
+                "valid_gt": True,
+                "correct": bool(hit),
+            }
+            achieved_scores.append(sc)
+            max_possible_scores.append(mx)
+            unweighted_hits += hit
+            total_cues += 1
+
+        rewards.append(
+            normalize_acoustic_reward(
+                achieved_scores,
+                max_possible_scores,
+                priors_dict=priors_dict,
+                use_zero_mean=use_zero_mean,
+                use_map=use_map,
+                use_inverse_frequency=use_inverse_frequency,
+                use_distance_based_payoff=use_distance_based_payoff,
+            )
+        )
+        gate_rewards.append(float(unweighted_hits / total_cues) if total_cues else 0.0)
+        if cue_trace_sink is not None:
+            cue_trace_sink.append(cue_details)
+
+    if return_gate_scores:
+        return rewards, gate_rewards
+    return rewards

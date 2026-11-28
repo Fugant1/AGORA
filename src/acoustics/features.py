@@ -1,134 +1,105 @@
-"""openSMILE eGeMAPSv02 feature extraction, caching, and acoustic inventory discretization."""
+"""openSMILE eGeMAPSv02 extraction and training integrity filtering (exact match to data_processing.ipynb)."""
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-import subprocess
-import sys
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import soundfile as sf
+from tqdm.auto import tqdm
 
-from src.utils.logging import get_logger
+from src.config import ACOUSTIC_CUES, ACOUSTIC_FEATURE_COLS
 
-logger = get_logger("acoustics.features")
-
-# Default mapping of Acoustic Inventory descriptors to eGeMAPSv02 functionals
-DEFAULT_ACOUSTIC_CUES: Dict[str, str] = {
-    "Pitch Height (st)": "F0semitoneFrom27.5Hz_sma3nz_amean",
-    "Pitch Dynamics (st)": "F0semitoneFrom27.5Hz_sma3nz_pctlrange0-2",
-    "Vocal Energy (Sones)": "loudness_sma3_percentile50.0",
-    "Speaking Rate (seg/s)": "VoicedSegmentsPerSec",
-    "Spectral Tilt (dB)": "hammarbergIndexV_sma3nz_amean",
-    "HNR (dB)": "HNRdBACF_sma3nz_amean",
-    "Jitter Local": "jitterLocal_sma3nz_amean",
-    "Shimmer Local (dB)": "shimmerLocaldB_sma3nz_amean",
-}
+_SMILE_EXTRACTOR = None
 
 
-class eGeMAPSExtractor:
-    """Manages eGeMAPSv02 functional extraction and disk caching for SER corpora."""
+def _get_smile_extractor():
+    global _SMILE_EXTRACTOR
+    if _SMILE_EXTRACTOR is None:
+        import opensmile
 
-    def __init__(
-        self,
-        cues_dict: Optional[Dict[str, str]] = None,
-        cache_path: Optional[Path] = None,
-        alt_cache_path: Optional[Path] = None,
-    ):
-        self.cues_dict = cues_dict or DEFAULT_ACOUSTIC_CUES
-        self.target_features = list(self.cues_dict.values())
-        self.cache_path = Path(cache_path) if cache_path else Path("/content/train_egemaps_features.csv")
-        self.alt_cache_path = Path(alt_cache_path) if alt_cache_path else Path("/content/raw_train_egemaps_features.csv")
-
-    def extract_or_load(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Extract missing acoustic features using openSMILE or load from precomputed cache.
-
-        Args:
-            df: DataFrame containing an 'audio_path' column.
-
-        Returns:
-            DataFrame with eGeMAPSv02 feature columns populated.
-        """
-        df = df.copy()
-        missing = [col for col in self.target_features if col not in df.columns]
-
-        if not missing:
-            logger.info("All target eGeMAPS acoustic features already present in DataFrame.")
-            return df
-
-        # 1. Attempt loading from cache
-        active_cache = None
-        if self.cache_path.exists():
-            active_cache = self.cache_path
-        elif self.alt_cache_path.exists():
-            active_cache = self.alt_cache_path
-
-        if active_cache is not None:
-            logger.info("Loading cached eGeMAPSv02 features from %s...", active_cache)
-            df_cached = pd.read_csv(active_cache)
-            if "audio_path" in df_cached.columns:
-                cols_to_merge = ["audio_path"] + [
-                    c for c in self.target_features if c in df_cached.columns and c not in df.columns
-                ]
-                df = df.merge(
-                    df_cached[cols_to_merge].drop_duplicates(subset=["audio_path"]),
-                    on="audio_path",
-                    how="left",
-                )
-            else:
-                cols_to_add = [c for c in missing if c in df_cached.columns]
-                df = pd.concat(
-                    [df.reset_index(drop=True), df_cached[cols_to_add].reset_index(drop=True)],
-                    axis=1,
-                )
-            return df
-
-        # 2. Extract using openSMILE
-        logger.info("Extracting acoustic features via openSMILE eGeMAPSv02 Functionals...")
-        try:
-            import opensmile
-        except ImportError:
-            logger.warning("openSMILE not installed. Installing via pip...")
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "opensmile"], check=True)
-            import opensmile
-
-        smile = opensmile.Smile(
+        _SMILE_EXTRACTOR = opensmile.Smile(
             feature_set=opensmile.FeatureSet.eGeMAPSv02,
             feature_level=opensmile.FeatureLevel.Functionals,
         )
+    return _SMILE_EXTRACTOR
 
-        extracted_records = []
-        valid_indices = []
 
-        try:
-            from tqdm.auto import tqdm
-            iterator = tqdm(df.iterrows(), total=len(df), desc="Extracting eGeMAPS")
-        except ImportError:
-            iterator = df.iterrows()
+def _extract_egemaps_for_row(task: Tuple[int, str]) -> Tuple[int, Dict[str, float], Optional[str]]:
+    idx, audio_path = task
+    if not audio_path or not Path(audio_path).exists():
+        return idx, {col: float("nan") for col in ACOUSTIC_FEATURE_COLS}, f"Missing file: {audio_path}"
+    try:
+        feats_df = _get_smile_extractor().process_file(str(audio_path))
+        row_feats = {
+            col: float(feats_df[col].iloc[0]) if col in feats_df.columns else float("nan")
+            for col in ACOUSTIC_FEATURE_COLS
+        }
+        return idx, row_feats, None
+    except Exception as exc:
+        return idx, {col: float("nan") for col in ACOUSTIC_FEATURE_COLS}, str(exc)
 
-        for idx, row in iterator:
-            p = Path(str(row["audio_path"]))
-            if p.is_file():
-                try:
-                    feat = smile.process_file(str(p))
-                    extracted_records.append(feat.iloc[0].to_dict())
-                    valid_indices.append(idx)
-                except Exception:
-                    pass
 
-        if extracted_records:
-            df_feats = pd.DataFrame(extracted_records, index=valid_indices)
-            for c in self.target_features:
-                if c in df_feats.columns:
-                    df.loc[valid_indices, c] = df_feats[c]
-
-            try:
-                self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-                df_feats["audio_path"] = df.loc[valid_indices, "audio_path"].values
-                df_feats.to_csv(self.cache_path, index=False)
-                df_feats.to_csv(self.alt_cache_path, index=False)
-                logger.info("Acoustic features successfully cached to %s", self.cache_path)
-            except Exception as e:
-                logger.warning("Could not write cache file: %s", e)
+def extract_egemaps_cues(
+    df: pd.DataFrame,
+    split_name: str,
+    max_workers: int = 8,
+) -> pd.DataFrame:
+    """Extract the 5 ACOUSTIC_CUES (eGeMAPSv02 Functionals) in parallel for a split DataFrame."""
+    out = df.copy().reset_index(drop=True)
+    if "duration" not in out.columns or out["duration"].isna().any():
+        if "time" in out.columns:
+            out["duration"] = pd.to_numeric(out["time"], errors="coerce")
         else:
-            logger.warning("No audio files could be processed. Verify MELD audio path extraction.")
+            out["duration"] = [
+                float(sf.info(str(p)).duration) if p and Path(str(p)).exists() else float("nan")
+                for p in out["audio_path"]
+            ]
 
-        return df
+    tasks = [(idx, str(row["audio_path"])) for idx, row in out.iterrows()]
+    extracted_rows: List[Optional[Dict[str, float]]] = [None] * len(out)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_extract_egemaps_for_row, t) for t in tasks]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc=f"eGeMAPSv02 [{split_name}]"):
+            idx, feat_dict, _ = fut.result()
+            extracted_rows[idx] = feat_dict
+
+    feats_table = pd.DataFrame(extracted_rows)
+    for col in ACOUSTIC_FEATURE_COLS:
+        out[col] = feats_table[col].values
+    for alias, col in ACOUSTIC_CUES.items():
+        out[alias] = out[col]
+    return out
+
+
+def filter_training_set_by_duration_and_nonzero_cues(
+    df: pd.DataFrame,
+    split_name: str = "train",
+    min_dur: float = 0.5,
+    max_dur: float = 20.0,
+    delete_rejected_wavs_in_data_dir: bool = True,
+    data_dir: Optional[Path] = None,
+) -> pd.DataFrame:
+    """Remove training utterances outside [min_dur, max_dur] or with any zero/NaN eGeMAPSv02 feature."""
+    dur_series = pd.to_numeric(df["duration"], errors="coerce")
+    bad_dur = dur_series.isna() | (dur_series < min_dur) | (dur_series > max_dur)
+
+    bad_cues = pd.Series(False, index=df.index)
+    for _, col in ACOUSTIC_CUES.items():
+        s = pd.to_numeric(df[col], errors="coerce")
+        bad_cues = bad_cues | s.isna() | (s == 0.0)
+
+    reject_mask = bad_dur | bad_cues
+    rejected_df = df.loc[reject_mask]
+    filtered_df = df.loc[~reject_mask].reset_index(drop=True)
+
+    if delete_rejected_wavs_in_data_dir and data_dir is not None:
+        data_root = Path(data_dir).resolve()
+        for wav_str in rejected_df["audio_path"].dropna().unique():
+            wav_p = Path(str(wav_str)).resolve()
+            if wav_p.exists() and wav_p.is_relative_to(data_root):
+                try:
+                    wav_p.unlink()
+                except OSError:
+                    pass
+    return filtered_df
