@@ -651,7 +651,7 @@ def test_full_run_all_simulation_skips_completed_stages_and_runs_only_whisperx_r
             continue
         if cell.get("id") == "nTVctV94NJk1":
             src = src.replace(
-                'DATA_DIR = Path("/home/fuganti/Projects/OPERA/data/meld_16k_mono")',
+                'DATA_DIR = Path("/home/fuganti/Projects/AGORA/data/meld_16k_mono")',
                 f'DATA_DIR = Path({str(local_dir)!r})',
             ).replace(
                 'MELD_DIR = Path("/home/fuganti/Projects/AFTA/data/prep_meld")',

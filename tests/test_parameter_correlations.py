@@ -15,7 +15,7 @@ import pandas as pd
 import pytest
 
 
-# Features mapeadas no OPERA
+# Features mapeadas no AGORA
 ACOUSTIC_CUE_MAP: Dict[str, str] = {
     "pitch_height": "F0semitoneFrom27.5Hz_sma3nz_amean",
     "pitch_dynamics": "F0semitoneFrom27.5Hz_sma3nz_pctlrange0-2",
