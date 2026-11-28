@@ -1,145 +1,111 @@
 # AGORA: Acoustic-Grounded Omni Reasoning for Affect
 
-**Acoustically Grounded Speech Emotion Recognition on `Qwen2.5-Omni-7B` via Hybrid Cue-Split GRPO**
+**Can verifiable acoustic grounding improve audio-only emotion recognition through reinforcement learning?**
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+AGORA investigates this question on MELD with `Qwen/Qwen2.5-Omni-7B` Thinker. The implemented pipeline uses EMO-TAG cleaning, acoustic labels derived from openSMILE and WhisperX, supervised fine-tuning (SFT), and cue-split Group Relative Policy Optimization (GRPO). The model receives audio and `effective_gender` metadata; therefore results should be described as audio-conditioned with gender metadata, not strictly audio-only.
 
----
+## Source pipeline
 
-## Research Overview
-
-Large omni-modal language models frequently rely on lexical shortcuts or emit unfaithful prosodic explanations when performing Speech Emotion Recognition (SER)—claiming pitch, loudness, or voice-quality patterns that contradict the physical speech signal or misreading lower-register male speech as neutral.
-
-**AGORA** trains `Qwen/Qwen2.5-Omni-7B` (`Qwen2_5OmniThinkerForConditionalGeneration`, 4-bit NF4 QLoRA) through an end-to-end **Jupyter Notebook pipeline** combining:
-1. **Laughter-cleaned, gender-normalized physical acoustic labeling** (**EMO-TAG** + **WhisperX** + **openSMILE `eGeMAPSv02`**),
-2. **Disjoint MILP-balanced Supervised Fine-Tuning (SFT)** with teacher-grounded prosodic reasoning, and
-3. **Hybrid Cue-Split Group Relative Policy Optimization (RLVR / GRPO)** that assigns local, mean-centered physical acoustic rewards directly to each generated cue value token while optimizing standardized emotion advantages on downstream reasoning and classification tokens.
+The executable implementation is under `src/`. Notebooks in the repository are research artifacts and are not the entry point documented here.
 
 ```text
-                  Cleaned 16 kHz Mono Speech + Speaker Gender (F / M)
-                                         │
-                 ┌───────────────────────┴───────────────────────┐
-                 ▼                                               ▼
-   Immutable Precomputed Cues                    Qwen2.5-Omni-7B Thinker (4-bit QLoRA)
-   • speaking_rate (WhisperX syll/s, global)     • Policy Adapter + Frozen sft_reference
-   • pitch_level   (eGeMAPS F0 p50, F/M Q25/Q75)                 │
-   • vocal_energy  (eGeMAPS Loudness, F/M Q25/Q75)               ▼
-   • timbre        (eGeMAPS alphaRatioV, F/M)      Rollout Sampling (G = 8)
-                 │                                 <think>
-                 │                                   [Acoustic Inventory]
-                 │                                   speaking_rate: ...   ◄── Cue-local centered R2 (L/n_c)
-                 │                                   pitch_level: ...     ◄── Cue-local centered R2 (L/n_c)
-                 │                                   vocal_energy: ...    ◄── Cue-local centered R2 (L/n_c)
-                 │                                   timbre: ...          ◄── Cue-local centered R2 (L/n_c)
-                 │                                   [Prosodic Reasoning]
-                 │                                   ...                  ◄── Standardized z(w1·R1 + w3·R3)
-                 │                                 </think>
-                 │                                 <answer>emotion</answer> ◄── Standardized z(w1·R1 + w3·R3)
-                 └───────────────────────┬───────────────────────┘
-                                         ▼
-                        Hybrid Cue-Split GRPO Policy Update
+MELD -> gender metadata -> 16 kHz mono -> EMO-TAG cleaning
+     -> eGeMAPSv02 features -> train-fitted acoustic quartiles
+     -> WhisperX syllable rates -> disjoint SFT/GRPO partitions
+     -> teacher-grounded SFT -> hybrid cue-split GRPO -> validation
 ```
 
----
-
-## Notebook Pipeline
-
-All experiments, preprocessing, training, diagnostics, and evaluations are self-contained in Jupyter notebooks designed for Google Colab (CUDA GPU + Google Drive persistence) or local GPU execution:
-
-| Stage | Notebook | Purpose & Outputs |
-| :--- | :--- | :--- |
-| **1. Data & Acoustics** | [`data_processing.ipynb`](data_processing.ipynb) | Loads official MELD splits (`train` / `dev → val` / `test`), resolves speaker sex (`F` / `M`), converts audio to `16 kHz` mono WAV, runs **EMO-TAG** 5-step single-utterance cleaning & laugh-track removal (`rVAD` + two-pass `WhisperX`), extracts **WhisperX** syllable rates and **openSMILE `eGeMAPSv02`** functionals, and fits train-only quartiles (`clean_train_set_with_cues.csv`: `6,059` clips; `clean_val_set_with_cues.csv`: `816` clips). |
-| **2. Cue Learnability** | [`cue_learnability.ipynb`](cue_learnability.ipynb) | Diagnostic QLoRA probe evaluating how accurately the frozen `Qwen2.5-Omni` audio encoder exposes individual prosodic cues (`pitch_level`, `vocal_energy`, `timbre`, `speaking_rate`, `pitch_variation`) across utterance duration bins and speaker genders. |
-| **3. Disjoint SFT (V4)** | [`ser_sft.ipynb`](ser_sft.ipynb) | Solves a **HiGHS MILP** (`scipy.optimize.milp`) to build a `1,050`-clip `emotion × effective_gender` balanced subset preserving empirical cue marginals, partitions it `60/40` into strictly disjoint `sft_train.csv` (`630` clips) and `grpo_train.csv` (`420` clips), distills concise teacher `[Prosodic Reasoning]`, trains the V4 SFT QLoRA adapter, and evaluates greedy validation (`N = 816`). |
-| **4. Hybrid GRPO (V3)** | [`ser_grpo_v3.ipynb`](ser_grpo_v3.ipynb) | **Primary RLVR notebook.** Loads the V4 SFT adapter + frozen `sft_reference`, trains 1-epoch **Hybrid Cue-Split GRPO** (`G = 8`, `105` steps) on the disjoint `420`-clip `grpo_train.csv`, logs live rollout & adapter telemetry, and runs post-training greedy validation (`N = 816`) + `model_health_report.md`. |
-| *(Legacy Prototype)* | [`ser_grpo_v2.ipynb`](ser_grpo_v2.ipynb) | Earlier 3-cue GRPO v2 notebook retained for reward/credit-assignment regression tests. |
-
----
-
-## Output Schema, Acoustic Cues, and Hybrid Rewards
-
-### Structured Student Output (`PROMPT_VERSION = gender_wxrate_4cue_srfirst_teacher_v5_short_concise`)
-Conditioned on the audio waveform and speaker vocal register (`female` or `male` via `effective_gender`), the model generates:
-
-```xml
-<think>
-[Acoustic Inventory]
-speaking_rate: low | moderate | high
-pitch_level: low | moderate | high
-vocal_energy: low | moderate | high
-timbre: low (muffled/soft) | moderate (modal) | high (tense/bright)
-[Prosodic Reasoning]
-Concise prosodic deduction integrating acoustic cues and spoken content.
-</think>
-<answer>anger | disgust | fear | joy | neutral | sadness | surprise</answer>
-```
-
-### Physical Acoustic Grounding (4 Ordinal Cues)
-All quartile thresholds (`Q25` / `Q75` $\rightarrow$ `25% low / 50% moderate / 25% high`) are fitted **exclusively on `clean_train_set`** (zero validation/test refitting):
-
-| Inventory Field | Backing Physical Feature | Normalization |
-| :--- | :--- | :--- |
-| `speaking_rate` | WhisperX aligned `whisperx_syllable_rate` (syllables/s) | Global `clean_train` `Q25` / `Q75` |
-| `pitch_level` | `eGeMAPSv02` `F0semitoneFrom27.5Hz_sma3nz_percentile50.0` (median $F_0$, st) | Gender-specific (`F` / `M`) `Q25` / `Q75` |
-| `vocal_energy` | `eGeMAPSv02` `loudness_sma3_percentile50.0` (median loudness, sones) | Gender-specific (`F` / `M`) `Q25` / `Q75` |
-| `timbre` | `eGeMAPSv02` `alphaRatioV_sma3nz_amean` (50–1000 Hz vs. 1–5 kHz ratio, dB) | Gender-specific (`F` / `M`) `Q25` / `Q75` |
-
-### Reward Objectives & Credit Assignment (`LOSS_TYPE = "hybrid"`)
-- **`R1` — Emotion Classification (`w1 = 1.0`)**: Empirical Inverse-Frequency payoff ($1 / (7 p_y)$ on exact match, $0$ on miss/invalid; `1.0` on balanced `grpo_train.csv`), standardized per audio group via GRPO `z`-score (`ddof=1`) so sparse minority-emotion hits retain full gradient leverage.
-- **`R2` — 4-Cue Physical Calibration (`w2 = 1.0`)**: Parameter-free Inverse-Frequency payoff per cue ($1 / (3 p_{c,y})$ on exact match, $0$ on miss/invalid; optional ordinal distance payoff via `USE_DISTANCE_BASED_PAYOFF=True`). Under `loss_type="hybrid"`, each cue's reward is **mean-centered within the $G=8$ group without `std` division** (`w2 / 4` per cue) and applied **only to that cue's value tokens** with `L / n_c` length compensation so multi-token `timbre` labels receive identical sequence-level weight to single-token cues.
-- **`R3` — 4-Slot Format Adherence (`w3 = 0.2`)**: `valid_slots / 4.0` verifying strict `<think>...</think><answer>...</answer>` ordering, all 4 canonical cue values, non-empty prosodic reasoning, and a valid canonical emotion label.
-- **Disjoint Span Routing (`USE_SPLIT_ADVANTAGE=True`, `USE_SPLIT_R2=True`)**:
-  - **Cue value tokens**: cue-local centered `R2` (`w2 / 4`, `L / n_c` compensated)
-  - **Inventory structure tokens**: `w3 · z(R3)`
-  - **`[Prosodic Reasoning]` + `</think>` + `<answer>` tokens**: `z(w1 · R1 + w3 · R3)`
-  - **Fast `BETA = 0.0` loss path**: `AudioGRPOTrainer.compute_loss` skips the redundant frozen `sft_reference` forward pass during training when `BETA == 0.0`, while retaining `sft_reference` for post-hoc teacher-forcing KL/drift replay diagnostics.
-
----
-
-## Validation Results (`N = 816` Official Cleaned MELD Dev → Val)
-
-Greedy decoding (`do_sample=False`, `EVAL_MAX_NEW_TOKENS=512`) across the full Stage-1 ablation chain (`630` SFT clips + `420` disjoint GRPO clips, `105` steps, `seed=42`):
-
-| Model | Accuracy | Weighted-F1 | Macro-F1 | **UAR (Macro-Recall)** | Invalid | Female MF1 | **Male MF1** | **`F − M` MF1 Gap** | 4-Cue Mean UAR | Pitch / Timbre $\rho$ |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Base (`Qwen2.5-Omni-7B`)** | 53.43% | 47.84% | 32.53% | 31.23% | 1.10% | 36.13% | 27.16% | +8.97 pp | — | — |
-| **SFT V4 (`ser_sft.ipynb`)** | 43.14% | 45.41% | 38.16% | 44.56% | 0.86% | 38.61% | 36.59% | **+2.02 pp** | 42.93% | — |
-| **GRPO v3 `no-R2` (`w2=0`)** | 46.08% | 47.55% | 39.34% | 41.96% | 1.23% | **43.86%** | 32.11% | +11.75 pp | 41.03% | `+0.479` / `+0.278` |
-| **GRPO v3 `with-R2` (`w2=1`)** | **46.45%** | **48.38%** | **40.77%** | **47.85%** | **0.74%** | 42.08% | **39.52%** | **+2.56 pp** | **46.75%** | **`+0.656` / `+0.448`** |
-
-Key takeaways from the controlled `with-R2` vs. `no-R2` ablation:
-- **Higher balanced & weighted SER**: Adding `R2` improves **UAR by `+5.89 pp`** (`47.85%` vs. `41.96%`, paired bootstrap 95% CI `[+0.49, +11.59] pp`, $P(\text{with-R2} > \text{no-R2}) = 98.4\%$), **Macro-F1 by `+1.43 pp`**, and **Weighted-F1 by `+0.83 pp`** (the only configuration surpassing both Base and SFT across Weighted-F1, Macro-F1, and UAR).
-- **Prevents male-speaker bias regression**: Removing `R2` causes Male Macro-F1 to drop from `36.59%` (SFT) to `32.11%` (`+11.75 pp` `F − M` gap), whereas gender-relative `R2` lifts Male Macro-F1 to **`39.52%`** (`+2.56 pp` gap) alongside sharp gains in male pitch ($\rho_M: +0.331 \rightarrow +0.568$) and timbre ($\rho_M: +0.259 \rightarrow +0.436$) perception.
-- **Prevents collateral acoustic forgetting**: Even when cue tokens receive `0.0` gradient (`no-R2`), shared LoRA updates degrade 4-cue UAR below SFT (`42.93% → 41.03%`), whereas `with-R2` raises 4-cue UAR to **`46.75%`** (`pitch_level` Macro-F1 `55.2%`, `timbre` Macro-F1 `45.6%`, `100%` valid 4-slot inventories).
-
----
-
-## Running the Notebooks & Verification Tests
-
-### 1. Notebook Execution Order
-1. Run [`data_processing.ipynb`](data_processing.ipynb) once to generate `clean_train_set_with_cues.csv`, `clean_val_set_with_cues.csv`, `gender_acoustic_quartiles.json`, and `meld_16k_mono_clean.tar` on Drive.
-2. *(Optional)* Run [`cue_learnability.ipynb`](cue_learnability.ipynb) to audit standalone cue learnability.
-3. Run [`ser_sft.ipynb`](ser_sft.ipynb) to create the verified `60/40` MILP split (`sft_train.csv` / `grpo_train.csv`), distill teacher reasoning, and save `final_sft_adapter`.
-4. Run [`ser_grpo_v3.ipynb`](ser_grpo_v3.ipynb) (`PER_DEVICE_TRAIN_BATCH_SIZE=2`, `STEPS_PER_GENERATION=8`, `GRADIENT_ACCUMULATION_STEPS=16`, `MAX_COMPLETION_LENGTH=256`, `EVAL_MAX_NEW_TOKENS=512`) to train `final_grpo_adapter` and export validation predictions, plots, and `model_health_report.md`.
-
-### 2. Local Automated Test Suite
-The notebook reward math, strict parsers, MILP partition invariants, WhisperX syllable-rate logic, hybrid cue-split token alignment, and health-report generators are verified directly against the `.ipynb` cells via `pytest`:
+Run commands from the repository root in an isolated Python environment with the required dependencies installed. Keep data and outputs in persistent storage, and select a machine appropriate to the run's CPU, RAM, and GPU needs.
 
 ```bash
-.venv/bin/pytest -v tests/test_ser_grpo_v3.py tests/test_sft_v2.py tests/test_data_processing_whisperx_rate.py tests/test_grpo_reward_math.py tests/test_split_r2.py tests/test_grpo_health_report.py
+python -m src.pipeline preprocess --meld-dir raw_data/prep_meld --data-dir data/meld_16k_mono
+python -m src.pipeline sft --data-dir data/meld_16k_mono
+python -m src.pipeline grpo --data-dir data/meld_16k_mono
+# Or execute all stages in sequence:
+python -m src.pipeline all --meld-dir raw_data/prep_meld --data-dir data/meld_16k_mono
 ```
 
----
+The CLI defaults to `semi_balanced` partitions, seed 42, SFT cue-weight exponent 0.5, R1 emotion inverse-frequency exponent 0.5, R2 cue exponent 1.0, `R2` weight 1.0, `R3` weight 0.2, `beta=0.05`, and vLLM rollouts. GRPO's CLI defaults are per-device batch size 2, 8 steps per generation, and gradient accumulation 16. Use `--no-vllm` to fall back to Hugging Face generation; this may be slower and is still subject to the selected model/backend's hardware and dependency requirements. `--vllm-quantization none` disables vLLM quantization. These options do not make the full pipeline CPU-only: QLoRA training requires a supported GPU setup.
 
-## Citation
+Set `--project-dir` to the persistent project directory when it differs from the current directory. Data defaults to `data/meld_16k_mono`; split manifests and CSVs default to `data/sft_grpo_gender_wxrate_60_40_semi25_v5`; model runs are written under `runs/ser_sft/<run-name>` and `runs/ser_grpo/<run-name>`. Use `--resume` for a GRPO checkpoint. Keep the split manifest, experiment JSON, logs, adapters, and evaluation outputs together so runs can be audited and resumed. The preprocessing stage currently fits/classifies acoustic cues and adds WhisperX rates for train and validation; it returns cleaned test audio without creating a test cue CSV or applying frozen train thresholds to the test split. Do not treat that output as a fully prepared held-out cue-evaluation set.
 
-```bibtex
-@misc{agora2026,
-  title={AGORA: Acoustic-Grounded Omni Reasoning for Speech Emotion Recognition via Hybrid Cue-Split GRPO},
-  author={Fuganti et al.},
-  year={2026},
-  publisher={GitHub},
-  howpublished={\url{https://github.com/Fugant1/AGORA}}
-}
-```
+The default `semi_balanced` partition keeps all available non-neutral utterances (rounded down by stratum to multiples of five) and selects neutral utterances to target a 0.25 neutral share, subject to available data. A cue-stratified MILP preserves emotion-by-effective-gender quotas while minimizing cue-marginal deviations; a second stratified selection divides the resulting pool 60/40 into disjoint SFT and GRPO utterances. Counts depend on the cleaned MELD data; historical notebook counts are not current source defaults. `--partition-mode uniform` is also available. Disjointness is at utterance/audio level, not a speaker- or dialogue-held-out split.
+
+## Acoustic targets and SFT
+
+The model predicts four ordinal inventory cues and one of seven MELD emotions. The student is prompted with the waveform and `effective_gender`; it is not given the transcript, gold emotion, or acoustic cue targets. For SFT rows only, a teacher target is generated using the transcript and precomputed labels.
+
+| Cue | Measurement | Label thresholds |
+| --- | --- | --- |
+| `speaking_rate` | WhisperX-aligned syllables per second | Global train Q25/Q75 |
+| `pitch_level` | eGeMAPSv02 median F0 in semitones | Effective-gender train Q25/Q75 |
+| `vocal_energy` | eGeMAPSv02 median loudness | Effective-gender train Q25/Q75 |
+| `timbre` | eGeMAPSv02 mean alpha ratio | Effective-gender train Q25/Q75 |
+
+Values below Q25 are `low`, above Q75 are `high`, and ties/between-threshold values are `moderate`. Quartiles are fit on cleaned training data and then reused for validation. Ties mean the labels are not guaranteed to have exact 25/50/25 proportions. The active inventory has four cues; the fifth extracted eGeMAPS feature, pitch variation, is not an active prediction target. WhisperX rate uses syllable count over the aligned utterance span; if aligned words are unavailable, source code falls back to reference-transcript syllable count over full clip duration, so fallback-derived rates should be identified in analyses.
+
+For cue class `k`, let `n_k` be its count among the `N` SFT rows and let `α` be the cue weighting exponent. The implemented tempered inverse-frequency weight is
+
+\[
+w_k = \frac{N n_k^{-\alpha}}{\sum_j n_j^{1-\alpha}}.
+\]
+
+Thus the expected weight under the empirical class distribution is one; `α=0` gives unit weights and `α=1` gives `N/(K n_k)`. By default `α=0.5`. Weights are fit separately for each cue using SFT rows; a missing cue class is an error.
+
+With equal multitask weighting enabled, let `L` be the number of supervised assistant tokens, `s=0.25` the cue-task share, and `K_c=4` the number of cues. Only the first token of each cue value span receives cue loss weight:
+
+\[
+q_{c,1}=\frac{L s}{K_c}w_{c,y_c}, \qquad
+q_t=\frac{L(1-s)}{L-K_c}\quad\text{for every other assistant token.}
+\]
+
+The response loss is the mean over examples of `Σ_active q_t CE_t / L`. Consequently, later tokens in a multi-token cue value are in the “other token” allocation. This is the implemented first-token decision weighting, not uniform weighting of every token in a cue span.
+
+## GRPO reward and token credit
+
+Each rollout receives three rewards: emotion correctness `R1`, four-cue acoustic calibration `R2`, and output format/reasoning quality `R3`. Priors for `R1` and `R2` are measured on the GRPO partition; they are not estimated from validation. For inverse-frequency exponent `α` and class prior `p_y`, the correct-label payoff is
+
+\[
+h_y=\frac{p_y^{-\alpha}}{\sum_j p_j^{1-\alpha}},
+\]
+
+with zero for an incorrect/invalid prediction in inverse-frequency mode. The default is `α=0.5` for emotion and `α=1` for each cue. At `α=1`, `h_y=1/(K p_y)`; a perfect prediction averaged over the empirical prior has payoff one. R2 may optionally use an ordinal distance payoff, but that is not the default.
+
+For rollout groups of size `G=8`, `z(x)=(x - mean(x))/(s_x + 1e-8)`, where `s_x` is the sample standard deviation (`ddof=1`); tied groups therefore have zero standardized advantage. Let `w_y=h_y` be the truth-class emotion payoff, `w1=1`, `w2=1`, `w3=0.2`, and `r2,c` be the raw payoff for cue `c`. The hybrid advantages implemented in `src/training/credit_assignment.py` are
+
+\[
+A_{\mathrm{emotion}}=w_y\,z\!\left(w_1\frac{R_1}{w_y}+w_3R_3\right),\qquad
+A_{\mathrm{format}}=w_3z(R_3),
+\]
+
+\[
+A_c=\frac{w_2}{4}\left(r_{2,c}-\overline{r_{2,c}}\right).
+\]
+
+The cue mean is computed within each rollout group and is not divided by its standard deviation. Emotion and format advantages use group standardization. Cue value tokens receive their cue-specific `A_c`, while inventory-structure tokens receive `A_format` and reasoning/emotion tokens receive `A_emotion`. If a completion boundary cannot be located, source code has a fallback that applies the combined advantage to the completion; such cases should be monitored in rollout diagnostics.
+
+For cue `c`, let `n_c` be its value-span token count and `L` the active completion-token count. The implemented cue span multiplier is
+
+\[
+\lambda_c=L\min\left(1,\frac{8}{n_c}\right).
+\]
+
+Thus spans up to eight tokens each get multiplier `L`; longer spans are capped to total scale `8L/n_c`. It is not `L/n_c` for short spans. The optional cue-only KL anchor uses the same cue-span multiplier and defaults to `β=0.05`; `--beta 0` disables the KL term. GRPO uses a score-function gradient path; its unit policy-ratio construction is not PPO clipping with an old-policy ratio.
+
+The format reward is composed in `src/rewards/format.py`: tag order (0.20), valid cue slots (0.35 times valid slots/4), reasoning length/character checks (up to 0.25), and valid emotion (0.20), with the result rounded to three decimals. Consult that implementation when changing this rubric.
+
+## Outputs and evaluation
+
+The pipeline evaluates SFT and GRPO checkpoints on validation and writes predictions, classification metrics (accuracy, macro/weighted F1, macro recall/UAR, invalid rate), per-class and gender breakdowns, cue metrics, and diagnostics under each run directory. These are validation measurements, not final held-out test results. No result table is presented here as a current `src` reproduction; previously recorded notebook metrics are historical and should not be attributed to this pipeline without reproducing them.
+
+The research target is IEEE Transactions on Affective Computing (TAFFC) or Interspeech. Publication claims should be based on held-out evaluation with matched baselines, confidence intervals, and checks that generated acoustic claims match the measured signals.
+
+## References
+
+- EMO-TAG, laughter/overlap-cleaned speech annotation: see the linked paper and implementation references in [`references/`](references/).
+- EmotionThinker, audio emotion reasoning: see [`references/`](references/).
+- Montreal Forced Aligner: McAuliffe et al., “Montreal Forced Aligner: Trainable Text-Speech Alignment Using Kaldi,” *Interspeech 2017*.
+- WhisperX: Bain et al., “WhisperX: Time-Accurate Speech Transcription of Long-Form Audio,” *Interspeech 2023*.
+- openSMILE/eGeMAPS: Eyben et al., “The Geneva Minimalistic Acoustic Parameter Set (GeMAPS) for Voice Research and Affective Computing,” *IEEE Transactions on Affective Computing*, 2016.
+
+For full paper metadata, consult the project references rather than treating notebook-era claims as sourced by this README.
